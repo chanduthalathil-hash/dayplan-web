@@ -383,11 +383,15 @@ body.dark .warn-box{background:#2a2110;border-color:#4a3a16;color:#e0b464}
  .wtask-row{display:flex;flex-wrap:wrap;gap:6px 14px;padding:12px 8px;border:1px solid var(--line);border-radius:12px;margin-bottom:8px;min-width:0}
  .wtask-scroll{overflow-x:visible}
  /* habit card header otherwise never wraps and overflows a phone-width card: icon + name +
-    the fixed-width "Today" / week-tracker / streak blocks together need ~650px */
+    the fixed-width "Today" / week-tracker / streak blocks together need ~650px. hc-mid gets
+    its own full-width row rather than squeezing onto the name's row — sharing a row left the
+    name's flex-basis:0 shrunk below its own text's width (min-width:0 permits that), so the
+    habit name visibly overlapped the "Today" label instead of wrapping or truncating */
  .hc-top{flex-wrap:wrap}
- .hc-mid{flex:1 1 140px}
- .week-tracker{flex:1 1 100%;justify-content:space-between;order:3}
- .hc-right{flex:0 0 auto;display:flex;align-items:center;gap:16px;text-align:left}
+ .hc-mid{flex:1 1 100%;order:1}
+ .week-tracker{flex:1 1 100%;justify-content:space-between;order:2}
+ .hc-right{flex:1 1 auto;display:flex;align-items:center;gap:16px;text-align:left;order:3}
+ .hc-top>.dots{order:3}
 }
 @media (max-width:480px){
  .greet h2{font-size:20px}
