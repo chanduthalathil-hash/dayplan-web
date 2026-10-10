@@ -53,7 +53,7 @@ nav{display:flex;flex-direction:column;gap:2px}
 .main{flex:1;min-width:0;display:flex;flex-direction:column;gap:20px}
 .topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
 .greet h2{font-size:24px;font-weight:800;margin:0}.greet p{margin:5px 0 0;color:var(--ink-2);font-size:13.5px}
-.top-actions{display:flex;align-items:center;gap:10px}
+.top-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .datenav{display:flex;align-items:center;gap:4px;border:1px solid var(--line-2);background:var(--card);border-radius:11px;padding:4px}
 .datenav button{border:none;background:none;cursor:pointer;color:var(--ink-2);width:30px;height:30px;border-radius:8px;display:grid;place-items:center}
 .datenav button:hover{background:var(--bg)}
@@ -253,7 +253,7 @@ body.dark .warn-box{background:#2a2110;border-color:#4a3a16;color:#e0b464}
 .stats6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
 .searchbox{position:relative;display:flex;align-items:center}
 .searchbox svg{position:absolute;left:12px;color:var(--ink-3);pointer-events:none}
-.searchbox input{font-family:inherit;font-size:12.5px;font-weight:600;padding:9px 12px 9px 34px;border-radius:11px;border:1px solid var(--line-2);background:var(--card);color:var(--ink);outline:none;width:190px}
+.searchbox input{font-family:inherit;font-size:12.5px;font-weight:600;padding:9px 12px 9px 34px;border-radius:11px;border:1px solid var(--line-2);background:var(--card);color:var(--ink);outline:none;width:190px;max-width:100%}
 .searchbox input:focus{border-color:var(--green)}
 .habit-card{border:1px solid var(--line);border-radius:16px;padding:16px;margin-bottom:14px;transition:.15s}
 .habit-card:hover{border-color:var(--line-2);box-shadow:var(--shadow)}
@@ -366,14 +366,37 @@ body.dark .warn-box{background:#2a2110;border-color:#4a3a16;color:#e0b464}
 @media (max-width:1150px){.grid{grid-template-columns:1fr}.grid2{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.stats5{grid-template-columns:1fr 1fr}.stats6{grid-template-columns:repeat(3,1fr)}.tips{grid-template-columns:1fr 1fr}.goals-grid{grid-template-columns:1fr}}
 @media (max-width:820px){
  .app{flex-direction:column;padding:14px;gap:14px}
- .sidebar{width:auto;flex:none;height:auto;position:static;flex-direction:row;flex-wrap:wrap;align-items:center;overflow:visible;padding:12px}
- nav{flex-direction:row;flex-wrap:wrap;flex:1}.nav-item span{display:none}
- .side-card,.toggle{display:none}.brand{padding:0 8px 0 0}
+ /* sidebar stays a normal top-to-bottom stack on mobile (brand, then a horizontally
+    scrollable nav strip, then the secondary cards) — it previously also switched to
+    flex-direction:row while `nav` inside it did the same, and that double row+wrap
+    combination squeezed the whole nav into a single-column sliver instead of laying
+    out sensibly; keeping the sidebar a column sidesteps that interaction entirely */
+ .sidebar{width:auto;flex:none;height:auto;position:static;overflow:visible;padding:12px}
+ .brand{padding:0 0 10px}
+ #progressCard{display:none} /* redundant with the "Plan Adherence" stat tile already in the main content */
+ nav{flex-direction:row;flex-wrap:nowrap;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin:0 -12px;padding:0 12px 2px}
+ nav::-webkit-scrollbar{display:none}
+ .nav-item{width:auto;flex:0 0 auto;white-space:nowrap}
  .stats{grid-template-columns:1fr}.stats5{grid-template-columns:1fr}.stats6{grid-template-columns:1fr 1fr}.tips{grid-template-columns:1fr}
+ .goals-grid,.habits-grid{grid-template-columns:1fr}
  .wtask-head{display:none}
  .wtask-row{display:flex;flex-wrap:wrap;gap:6px 14px;padding:12px 8px;border:1px solid var(--line);border-radius:12px;margin-bottom:8px;min-width:0}
  .wtask-scroll{overflow-x:visible}
+ /* habit card header otherwise never wraps and overflows a phone-width card: icon + name +
+    the fixed-width "Today" / week-tracker / streak blocks together need ~650px */
+ .hc-top{flex-wrap:wrap}
+ .hc-mid{flex:1 1 140px}
+ .week-tracker{flex:1 1 100%;justify-content:space-between;order:3}
+ .hc-right{flex:0 0 auto;display:flex;align-items:center;gap:16px;text-align:left}
 }
+@media (max-width:480px){
+ .greet h2{font-size:20px}
+ .row2,.row3{grid-template-columns:1fr}
+ .datenav .dl{min-width:0}
+ .donut-wrap{width:140px;height:140px}
+ .donut-wrap svg{width:140px;height:140px}
+}
+body{overflow-x:hidden}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
