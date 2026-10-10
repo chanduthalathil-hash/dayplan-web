@@ -100,17 +100,18 @@ nav{display:flex;flex-direction:column;gap:2px}
 .act.act-missed::before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:4px;border-radius:13px 0 0 13px;background:#ef4444}
 @keyframes actBlink{0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,.45)}50%{box-shadow:0 0 0 6px rgba(245,158,11,0)}}
 .act .aic{width:38px;height:38px;border-radius:11px;display:grid;place-items:center;flex:0 0 38px}
+.act .atx{flex:1;min-width:0}
 .act .an{font-weight:700;font-size:13.5px}
 .act.done .an{text-decoration:line-through;text-decoration-color:var(--ink-3)}
-.act .at{font-size:11.5px;color:var(--ink-3);margin-top:1px}
-.act .ar{margin-left:auto;display:flex;align-items:center;gap:6px}
+.act .at{font-size:11.5px;color:var(--ink-3);margin-top:1px;display:flex;flex-wrap:wrap;align-items:center;gap:2px 6px}
+.act .ar{margin-left:auto;display:flex;align-items:center;gap:6px;flex:0 0 auto}
 .chk{width:26px;height:26px;border-radius:50%;border:2px solid var(--line-2);cursor:pointer;display:grid;place-items:center;color:transparent;transition:.14s;background:none}
 .chk.on{background:var(--green);border-color:var(--green);color:#fff}
 .chk.skip{background:var(--amber);border-color:var(--amber);color:#fff}
 .chk.post{background:var(--blue);border-color:var(--blue);color:#fff}
 .dots{border:none;background:none;color:var(--ink-3);cursor:pointer;width:26px;height:26px;border-radius:7px}
 .dots:hover{background:var(--bg);color:var(--ink)}
-.st-tag{font-size:10px;font-weight:700;padding:1px 7px;border-radius:6px;margin-left:6px}
+.st-tag{font-size:10px;font-weight:700;padding:1px 7px;border-radius:6px;white-space:nowrap}
 .st-tag.skipped{background:#fef3e2;color:#b45309}.st-tag.postponed{background:#e9f2ff;color:#2563eb}.st-tag.missed{background:#fee2e2;color:#dc2626}
 body.dark .st-tag.skipped{background:#3a2a12}body.dark .st-tag.postponed{background:#16233c}body.dark .st-tag.missed{background:#3a1414}
 /* weekly overview */
@@ -378,6 +379,12 @@ body.dark .warn-box{background:#2a2110;border-color:#4a3a16;color:#e0b464}
  nav{flex-direction:row;flex-wrap:nowrap;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin:0 -12px;padding:0 12px 2px}
  nav::-webkit-scrollbar{display:none}
  .nav-item{width:auto;flex:0 0 auto;white-space:nowrap}
+ /* the 74px time-gutter column is redundant on a phone-width card — the activity's own
+    start–end range is already shown inside it via .at — and squeezing both it and the
+    card into ~340px is exactly why a title+status-tag combo would wrap unpredictably
+    and make neighboring timeline rows different heights */
+ .tl-item{grid-template-columns:1fr}
+ .tl-time{display:none}
  .stats{grid-template-columns:1fr}.stats5{grid-template-columns:1fr}.stats6{grid-template-columns:1fr 1fr}.tips{grid-template-columns:1fr}
  .goals-grid,.habits-grid{grid-template-columns:1fr}
  .wtask-head{display:none}
@@ -926,7 +933,7 @@ function renderTimeline(mode){
    const tag=a.status==='skipped'?'<span class="st-tag skipped">Skipped</span>':a.status==='postponed'?'<span class="st-tag postponed">Postponed</span>':missed?'<span class="st-tag missed">Not completed</span>':'';
    const inner=`<div class="act ${a.status==='done'?'done':''} ${isNowActive(a)?'act-now':''} ${missed?'act-missed':''}" data-id="${a.id}" ${mode==='list'?'draggable="true"':''}>
      <div class="aic" style="background:${tint(a.color)};color:${a.color}">${svg(a.icon,19)}</div>
-     <div><div class="an">${esc(a.title)}${tag}</div><div class="at">${fmt12(a.start)} – ${fmt12(a.end)} (${durLabel(a.start,a.end)})</div></div>
+     <div class="atx"><div class="an">${esc(a.title)}</div><div class="at">${fmt12(a.start)} – ${fmt12(a.end)} (${durLabel(a.start,a.end)})${tag}</div></div>
      <div class="ar"><button class="dots" data-menu="${a.id}">${svg('more',15)}</button><button class="chk ${chkCls}" data-toggle="${a.id}">${svg('check',15)}</button></div>
    </div>`;
    return mode==='timeline'?`<div class="tl-item"><div class="tl-time">${fmt12(a.start).replace(' ','\n')}</div><div class="tl-mid" style="--dotc:${a.color}">${inner}</div></div>`:`<div style="margin-bottom:10px">${inner}</div>`;
@@ -952,8 +959,8 @@ function updateNowActive(){
    const nowMissed=isMissed(a);
    el.classList.toggle('act-missed', nowMissed);
    if(nowMissed&&!el.querySelector('.st-tag.missed')){
-     const an=el.querySelector('.an');
-     if(an)an.insertAdjacentHTML('beforeend','<span class="st-tag missed">Not completed</span>');
+     const at=el.querySelector('.at');
+     if(at)at.insertAdjacentHTML('beforeend','<span class="st-tag missed">Not completed</span>');
    }
  });
 }
