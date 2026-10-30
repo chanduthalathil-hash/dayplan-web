@@ -61,6 +61,9 @@
       { t: 'Go to Analytics', ic: 'analytics', kb: '5', run: () => setView('analytics') },
       { t: 'Go to Calendar', ic: 'calendar', run: () => setView('calendar') },
       { t: 'Go to Notes', ic: 'notes', run: () => setView('notes') },
+      { t: 'Go to My Work (weekly journal)', ic: 'notes', run: () => { workUI.section = 'mywork'; setView('work'); } },
+      { t: 'New work journal entry', ic: 'plus', run: () => mwEntryModal(mwWeekOf(todayStr()), {}) },
+      { t: 'Prepare stand-up summary', ic: 'mic', run: () => mwStandupModal(mwWeekOf(todayStr())) },
       { t: 'Settings', ic: 'settings', run: () => setView('settings') },
       { t: 'Toggle dark mode', ic: 'moon', kb: 'D', run: () => { pref.dark = !pref.dark; applyDark(); queueSave(); } },
       { t: 'Jump to today', ic: 'today', kb: 'T', run: () => loadDay(todayStr()) }
@@ -100,7 +103,7 @@
 
   /* ---------- Keyboard shortcuts ---------- */
   document.addEventListener('keydown', (e) => {
-    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || '')) && e.target.id !== 'cmdkIn';
+    const typing = (/^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || '')) || e.target.isContentEditable) && e.target.id !== 'cmdkIn';
     if (ov.classList.contains('show')) {
       if (e.key === 'Escape') { e.preventDefault(); closePalette(); }
       else if (e.key === 'ArrowDown') { e.preventDefault(); cmdSel = Math.min(cmdSel + 1, cmdItems.length - 1); renderPalette($('#cmdkIn').value); }
@@ -255,16 +258,17 @@
     const card = document.createElement('div');
     card.className = 'card';
     card.style.marginTop = '20px';
-    card.innerHTML = `<div class="card-head"><h3>Desktop</h3></div>
+    card.innerHTML = `<div class="card-head"><h3>Desktop</h3><span class="status-badge st-completed" id="appVer" title="Installed DayPlan version">DayPlan</span></div>
       <div class="toggle" style="margin-top:0">Track screen time automatically <span class="sw ${pref.autoScreen !== false ? 'on' : ''}" id="asSw"></span></div>
       <div class="toggle">Close button minimises to tray <span class="sw ${pref.minTray !== false ? 'on' : ''}" id="mtSw"></span></div>
-      <div class="sub" style="margin:12px 0 0">Global shortcuts: <b>Ctrl+Shift+D</b> quick capture · <b>Ctrl+Alt+F</b> focus · <b>Ctrl+Shift+P</b> command palette. In-app: <b>Ctrl+K</b> palette, <b>P</b> plan, <b>A</b> add, <b>F</b> focus, <b>R</b> review, <b>←/→</b> change day.</div>
+      <div class="sub" style="margin:12px 0 0">Global shortcuts: <b>Ctrl+Shift+D</b> quick capture · <b>Ctrl+Alt+F</b> focus · <b>Ctrl+Shift+G</b> command palette. In-app: <b>Ctrl+K</b> palette, <b>P</b> plan, <b>A</b> add, <b>F</b> focus, <b>R</b> review, <b>←/→</b> change day.</div>
       <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
         <button class="btn" id="expBtn">Export backup</button>
         <button class="btn" id="impBtn">Import backup</button>
         <button class="btn" id="revBtn">Show data file</button>
       </div>`;
     el.appendChild(card);
+    if (D.version) D.version().then((v) => { const b = card.querySelector('#appVer'); if (b && v) b.textContent = 'Version ' + v; }).catch(() => {});
     card.querySelector('#asSw').onclick = (e) => { pref.autoScreen = pref.autoScreen === false; e.target.classList.toggle('on', pref.autoScreen !== false); queueSave(); };
     card.querySelector('#mtSw').onclick = (e) => { pref.minTray = pref.minTray === false; e.target.classList.toggle('on', pref.minTray !== false); DB.set('dp:minimizeToTray', pref.minTray !== false); queueSave(); };
     card.querySelector('#expBtn').onclick = async () => { const p = await D.store.export(); if (p) toast('Backup saved'); };
