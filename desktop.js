@@ -54,7 +54,7 @@
       { t: 'Add habit', ic: 'check', run: () => habitModal() },
       { t: 'Add goal', ic: 'goal', run: () => goalModal() },
       { t: 'Add routine block', ic: 'planner', run: () => templateModal() },
-      { t: 'Go to Today', ic: 'today', kb: '1', run: () => setView('today') },
+      { t: 'Go to Today', ic: 'today', kb: '1', run: () => goToday() },
       { t: 'Go to Planner', ic: 'planner', kb: '2', run: () => setView('planner') },
       { t: 'Go to Habits', ic: 'habits', kb: '3', run: () => setView('habits') },
       { t: 'Go to Goals', ic: 'goal', kb: '4', run: () => setView('goals') },
@@ -117,7 +117,7 @@
     const map = {
       p: () => planMyDay(), a: () => activityModal(), f: () => startFocus(), r: () => reviewModal(),
       t: () => loadDay(todayStr()), d: () => { pref.dark = !pref.dark; applyDark(); queueSave(); },
-      '1': () => setView('today'), '2': () => setView('planner'), '3': () => setView('habits'),
+      '1': () => goToday(), '2': () => setView('planner'), '3': () => setView('habits'),
       '4': () => setView('goals'), '5': () => setView('analytics'),
       arrowleft: () => loadDay(addDays(dayStr, -1)), arrowright: () => loadDay(addDays(dayStr, 1))
     };

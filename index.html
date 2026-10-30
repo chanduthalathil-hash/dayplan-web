@@ -44,6 +44,7 @@ nav{display:flex;flex-direction:column;gap:2px}
 .btn.primary{background:var(--green-600);border-color:var(--green-600);color:#fff}.btn.primary:hover{background:#15803d}
 .btn.full{width:100%;justify-content:center}
 .btn.sm{padding:6px 11px;font-size:12px;border-radius:9px}
+.btn:disabled{opacity:.6;cursor:default}
 .btn svg{width:16px;height:16px}
 .toggle{display:flex;align-items:center;justify-content:space-between;border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-top:14px;font-weight:600;font-size:13.5px}
 .sw{width:42px;height:24px;border-radius:99px;background:var(--line-2);position:relative;cursor:pointer;transition:.2s;flex:0 0 42px}
@@ -344,6 +345,9 @@ body.dark .warn-box{background:#2a2110;border-color:#4a3a16;color:#e0b464}
 .wteam-state.completed{color:var(--green-600)}
 .wteam-state.in-progress{color:#2563eb}
 .wteam-state.not-started{color:var(--ink-3)}
+.wteam-sum{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid var(--line)}
+.wteam-sum-h{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:2px}
+.wteam-sum .wteam-row{gap:10px}
 .wdeadline-item{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line);cursor:pointer}
 .wdeadline-item:last-child{border-bottom:none}
 .wdeadline-date{width:40px;text-align:center;background:var(--bg);border-radius:9px;padding:5px 0;flex:0 0 40px}
@@ -403,6 +407,7 @@ body.dark .warn-box{background:#2a2110;border-color:#4a3a16;color:#e0b464}
 .mw-et:hover{color:var(--green-600)}
 .mw-em{font-size:11.5px;color:var(--ink-3);font-weight:600;margin-top:3px;display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center}
 .mw-em .wchip{margin-top:0}
+.wchip.mw-proj{background:var(--bg);color:var(--ink-2);display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line-2)}
 .mw-st{border:none;cursor:pointer;font-family:inherit}
 .mw-desc{margin-top:10px}
 .mw-sec{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line-2)}
@@ -663,27 +668,35 @@ function scheduleSync(){if(!syncEnabled())return;clearTimeout(syncDebounce);sync
 
 async function apiFetch(path,opts){
  opts=opts||{};
- const res=await fetch(SYNC_API+path,{...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});
+ let res;
+ try{res=await fetch(SYNC_API+path,{...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});}
+ catch(e){throw Object.assign(new Error("Can't reach the sync server — check your internet connection and try again."),{status:0});}
  let body=null;try{body=await res.json();}catch(e){}
  if(!res.ok)throw Object.assign(new Error((body&&body.error)||('HTTP '+res.status)),{status:res.status});
  return body;
 }
 async function doRegister(email,password){
  const r=await apiFetch('/api/auth/register',{method:'POST',body:JSON.stringify({email,password})});
- account={email:r.email,token:r.token};await DB.set(ACCOUNT_KEY,account);
- syncState={pushed:{},lastPulledAt:0,syncing:false};
- teamsLoaded=false;
- await syncNow();
+ await startSession(r);
  return r;
 }
 async function doLogin(email,password){
  const r=await apiFetch('/api/auth/login',{method:'POST',body:JSON.stringify({email,password})});
+ await startSession(r);
+ return r;
+}
+/* the account is usable as soon as the server answers — the first full sync can take a while (it pushes
+   every local key), so it runs in the background instead of holding the login screen hostage until it ends */
+async function startSession(r){
  account={email:r.email,token:r.token};await DB.set(ACCOUNT_KEY,account);
  syncState={pushed:{},lastPulledAt:0,syncing:false};
  teamsLoaded=false;
- await syncNow();
- return r;
+ syncNow().then(()=>{if(view==='settings')render();});
 }
+/* Render's free plan sleeps the server after ~15 idle minutes and the first request then waits ~30–60s for it
+   to boot — pinging health as soon as the login form shows starts that boot while the user is still typing */
+let authBusy=null,authEmail='',serverWoken=false;
+function wakeSyncServer(){if(serverWoken)return;serverWoken=true;fetch(SYNC_API+'/api/health').catch(()=>{serverWoken=false;});}
 async function doLogout(){
  account=null;await DB.delete(ACCOUNT_KEY);
  syncState={pushed:{},lastPulledAt:0,syncing:false};
@@ -697,12 +710,33 @@ async function doLogout(){
 let myTeams=[],teamStateCache={},teamsLoaded=false;
 function authHeaders(){return{Authorization:'Bearer '+account.token};}
 async function refreshMyTeams(){if(!syncEnabled())return;const r=await apiFetch('/api/team/mine',{headers:authHeaders()});myTeams=r.teams||[];}
-async function fetchTeamState(teamId){if(!syncEnabled())return null;const r=await apiFetch('/api/team/'+teamId+'/state',{headers:authHeaders()});teamStateCache[teamId]=r;return r;}
+/* the server only stores a status row once a member has set one (a new task gets a row for its creator alone),
+   so every member without a row is filled in as "Not Started" — otherwise teammates who haven't touched a task
+   simply vanish from its progress and "1 / 1 completed" hides that anyone else is on it */
+function normalizeTeamState(r){
+ const emails=(r.members||[]).map(m=>m.email);
+ (r.tasks||[]).forEach(t=>{t.statuses=t.statuses||{};emails.forEach(e=>{if(!t.statuses[e])t.statuses[e]='Not Started';});});
+ return r;
+}
+async function fetchTeamState(teamId){if(!syncEnabled())return null;const r=normalizeTeamState(await apiFetch('/api/team/'+teamId+'/state',{headers:authHeaders()}));teamStateCache[teamId]=r;return r;}
+let teamsFetchedAt=0,teamsRefreshing=false;
 async function ensureTeamsLoaded(){
  if(teamsLoaded||!syncEnabled())return;
  teamsLoaded=true;
- try{await refreshMyTeams();await Promise.all(myTeams.map(t=>fetchTeamState(t.id)));}catch(e){teamsLoaded=false;}
+ try{await refreshMyTeams();await Promise.all(myTeams.map(t=>fetchTeamState(t.id)));teamsFetchedAt=Date.now();}catch(e){teamsLoaded=false;}
 }
+/* teammates change their statuses on their own devices, so team state is re-fetched in the background —
+   on opening the Work tab (at most every 30s), every minute while it stays open, and when the window regains focus */
+async function refreshTeamsInBackground(force){
+ if(!syncEnabled()||teamsRefreshing||!teamsLoaded)return;
+ if(!force&&Date.now()-teamsFetchedAt<30000)return;
+ teamsRefreshing=true;
+ try{await refreshMyTeams();await Promise.all(myTeams.map(t=>fetchTeamState(t.id)));teamsFetchedAt=Date.now();if(view==='work'&&workUI.section!=='mywork')render();}
+ catch(e){console.error('team refresh failed',e);}
+ teamsRefreshing=false;
+}
+setInterval(()=>{if(view==='work'&&workUI.section!=='mywork'&&document.visibilityState!=='hidden')refreshTeamsInBackground(true);},60000);
+window.addEventListener('focus',()=>{if(view==='work')refreshTeamsInBackground();});
 async function createTeamRemote(name){const r=await apiFetch('/api/team/create',{method:'POST',headers:authHeaders(),body:JSON.stringify({name})});await refreshMyTeams();await fetchTeamState(r.id);return r;}
 async function joinTeamRemote(code){const r=await apiFetch('/api/team/join',{method:'POST',headers:authHeaders(),body:JSON.stringify({inviteCode:code})});await refreshMyTeams();await fetchTeamState(r.id);return r;}
 async function createSharedTaskRemote(teamId,fields){const r=await apiFetch('/api/team/'+teamId+'/tasks',{method:'POST',headers:authHeaders(),body:JSON.stringify(fields)});await fetchTeamState(teamId);return r;}
@@ -857,7 +891,10 @@ function dayStats(d,ds){
 const NAV=[['today','Today','today'],['planner','Planner','planner'],['work','Work','work'],['tasks','Tasks','today'],['habits','Habits','habits'],['goals','Goals','goals'],['analytics','Analytics','analytics'],['calendar','Calendar','calendar'],['notes','Notes','notes'],['settings','Settings','settings']];
 function buildNav(){document.getElementById('nav').innerHTML=NAV.map(n=>`<button class="nav-item" data-nav="${n[2]}" data-key="${n[0]}">${svg(n[0],18)}<span>${n[1]}</span></button>`).join('');}
 function setView(v){view=v;document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.nav===v));render();}
-document.getElementById('nav').addEventListener('click',e=>{const b=e.target.closest('[data-nav]');if(b)setView(b.dataset.nav);});
+/* "Today" always means the real current day — the planner may be parked on another date (calendar, ←/→,
+   the day restored at launch) or the app may have stayed open past midnight */
+function goToday(){if(dayStr!==todayStr())loadDay(todayStr()).then(()=>setView('today'));else setView('today');}
+document.getElementById('nav').addEventListener('click',e=>{const b=e.target.closest('[data-nav]');if(!b)return;if(b.dataset.key==='today')goToday();else setView(b.dataset.nav);});
 document.getElementById('prevDay').onclick=()=>loadDay(addDays(dayStr,-1));
 document.getElementById('nextDay').onclick=()=>loadDay(addDays(dayStr,1));
 document.getElementById('reviewBtn').onclick=reviewModal;
@@ -1718,6 +1755,18 @@ async function scheduleTaskToDayPlan(task,date,start,end){
  pushTaskHistory(task,'Scheduled '+dateLabel(date)+', '+fmt12(start)+'–'+fmt12(end));
 }
 
+/* per-member tally across each team's shared tasks — what everyone has done, not just the next due task */
+function teamMembersSummaryHTML(){
+ const myEmail=account?account.email:null;
+ return myTeams.map(t=>{
+   const st=teamStateCache[t.id],tasks=(st&&st.tasks)||[];
+   const emails=st&&st.members?st.members.map(m=>m.email):(t.members||[]);
+   return `<div class="wteam-sum"><div class="wteam-sum-h"><b>👥 ${esc(t.name)}</b><span class="sub" style="margin:0">${tasks.length} shared ${tasks.length===1?'task':'tasks'}</span></div>
+    ${emails.map(e=>{const c={'Completed':0,'In Progress':0,'Not Started':0};tasks.forEach(k=>{const s=(k.statuses||{})[e]||'Not Started';c[s]=(c[s]||0)+1;});
+      return `<div class="wteam-row" style="cursor:default"><span class="avatar" style="background:${emailColor(e)};margin-left:0">${initials(emailName(e))}</span><span class="wteam-name">${esc(emailName(e))}${e===myEmail?' (you)':''}</span><span class="wteam-state completed">${c.Completed} done</span><span class="wteam-state in-progress">${c['In Progress']} doing</span><span class="wteam-state not-started">${c['Not Started']} to do</span></div>`;}).join('')}
+   </div>`;
+ }).join('');
+}
 function teamProgressServerHTML(teamId,t){
  const emails=Object.keys(t.statuses||{});
  const doneN=emails.filter(e=>t.statuses[e]==='Completed').length;
@@ -1792,6 +1841,7 @@ async function viewWork(el){
  if(workUI.section==='mywork')return viewMyWork(el);
  ensureRecurringOccurrences();
  await ensureTeamsLoaded();
+ refreshTeamsInBackground();
  await ensureTeamRecurringSchedules();
  const localTasks=pref.workTasks||[];
  const teamTaskRows=allSharedTasks().map(({teamId,teamName,task})=>{
@@ -1871,8 +1921,8 @@ async function viewWork(el){
    </div>
    <div class="col">
     <div class="card">
-     <div class="card-head"><h3>Team Progress</h3><button class="btn sm" id="teamViewAll">View all</button></div>
-     ${!syncEnabled()?'<div class="empty">Log in from Settings, then create or join a team to collaborate.</div>':featuredTeam?teamProgressServerHTML(featuredTeam.teamId,featuredTeam.task):'<div class="empty">No shared tasks yet — create one from + New Task.</div>'}
+     <div class="card-head"><h3>Team Progress</h3><div style="display:flex;gap:6px;align-items:center">${syncEnabled()&&teamsFetchedAt?`<span class="sub" style="margin:0">Updated ${new Date(teamsFetchedAt).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}</span><button class="btn sm" id="teamRefresh" title="Refresh team status">${svg('sync',14)}</button>`:''}<button class="btn sm" id="teamViewAll">View all</button></div></div>
+     ${!syncEnabled()?'<div class="empty">Log in from Settings, then create or join a team to collaborate.</div>':teamMembersSummaryHTML()+(featuredTeam?`<div class="sub" style="margin:4px 0 6px;font-weight:700">Next due shared task</div>`+teamProgressServerHTML(featuredTeam.teamId,featuredTeam.task):'<div class="empty">No shared tasks yet — create one from + New Task.</div>')}
     </div>
     <div class="card">
      <div class="card-head"><h3>Upcoming Deadlines</h3><button class="btn sm" id="deadlineViewAll">View all</button></div>
@@ -1916,6 +1966,7 @@ async function viewWork(el){
    const hit=allSharedTasks().find(x=>x.task.id===b.dataset.wsopen);if(hit)teamTaskDetailModal(hit.teamId,hit.task.id);
  });
  const goTodayBtn=el.querySelector('#goTodayPlan');if(goTodayBtn)goTodayBtn.onclick=()=>{loadDay(todayStr());setView('today');};
+ const teamRf=el.querySelector('#teamRefresh');if(teamRf)teamRf.onclick=async()=>{teamRf.disabled=true;await refreshTeamsInBackground(true);toast('Team status updated');};
  const teamAll=el.querySelector('#teamViewAll');if(teamAll)teamAll.onclick=()=>{workUI.filterView='shared';workUI.tab='all';render();};
  const dlAll=el.querySelector('#deadlineViewAll');if(dlAll)dlAll.onclick=()=>{workUI.filterView=null;workUI.tab='upcoming';render();};
  const rcAll=el.querySelector('#recurViewAll');if(rcAll)rcAll.onclick=()=>{workUI.filterView='recurring';workUI.tab='all';render();};
@@ -1970,6 +2021,16 @@ function mwWeekNo(w){const th=new Date(addDays(w,3)+'T00:00Z');return Math.ceil(
 function mwDayLabel(ds){const d=new Date(ds+'T00:00');return DAYNAMES[d.getDay()]+', '+mwMon(d)+' '+d.getDate();}
 function mwCat(cid){return (mwCats||[]).find(c=>c.id===cid)||{id:cid,name:'Unknown category',description:'',color:'#94a3b8',icon:'tag',archived:true};}
 function mwCatChip(c){return `<span class="wchip" style="background:${tint(c.color)};color:${c.color}">${esc(c.name)}</span>`;}
+function mwProjChip(e){return e.project?`<span class="wchip mw-proj" title="Project">${svg('work',11)}${esc(e.project)}</span>`:'';}
+/* project names to suggest: the Tasks & Projects list plus every name already used in My Work, de-duplicated */
+async function mwProjectNames(){
+ const seen=new Map();
+ const add=n=>{n=(n||'').trim();if(n&&!seen.has(n.toLowerCase()))seen.set(n.toLowerCase(),n);};
+ (pref.workProjects||[]).forEach(p=>add(p.name));
+ (await mwLoadAllWeeks()).forEach(wk=>wk.entries.forEach(e=>add(e.project)));
+ return [...seen.values()].sort((a,b)=>a.localeCompare(b));
+}
+function mwSuTitle(e){return e.title+(e.project?` [${e.project}]`:'');}
 function mwStatusOf(e){return MW_STATUSES.includes(e.status)?e.status:'Pending';}
 function mwCounts(es){const c={total:es.length,Completed:0,'In Progress':0,Pending:0,Blocked:0};es.forEach(e=>c[mwStatusOf(e)]++);return c;}
 function mwOverall(c){if(!c.total)return 'Not Started';if(c.Blocked)return 'Blocked';if(c.Completed===c.total)return 'Completed';if(c['In Progress']||c.Completed)return 'In Progress';return 'Pending';}
@@ -2180,7 +2241,7 @@ function mwEntryCardHTML(w,e,showCat){
  const secs=MW_FIELDS.filter(f=>mwPlain(e[f[0]])).map(f=>`<div class="mw-sec"><div class="mw-sec-h">${f[1]}</div><div class="rte-view">${mwSanitize(e[f[0]])}</div></div>`).join('');
  return `<div class="mw-entry">
   <div class="mw-entry-head">
-   <div style="flex:1;min-width:0"><div class="mw-et" data-mwedit="${ref}" title="Edit entry">${esc(e.title)}</div><div class="mw-em">${mwDayLabel(e.date)}${showCat?' '+mwCatChip(mwCat(e.categoryId)):''}</div></div>
+   <div style="flex:1;min-width:0"><div class="mw-et" data-mwedit="${ref}" title="Edit entry">${esc(e.title)}</div><div class="mw-em">${mwDayLabel(e.date)}${showCat?' '+mwCatChip(mwCat(e.categoryId)):''} ${mwProjChip(e)}</div></div>
    <button class="status-badge st-${slug(st)} mw-st" data-mwemenu="${ref}" title="Change status">${st} ▾</button>
    <button class="dots" data-mwemenu="${ref}">${svg('more',15)}</button>
   </div>
@@ -2193,7 +2254,7 @@ function mwRowHTML(w,e,meta,qv){
  let snip=qv?mwSnippet(e,qv):(mwPlain(e.description)||mwPlain(e.outcome));
  if(!qv&&snip.length>180)snip=snip.slice(0,180)+'…';
  const hi=t=>qv?mwHi(t,qv):esc(t);
- return `<div class="mw-row" data-mwview="${w}|${e.id}"><span class="mw-dot" style="background:${cat.color}"></span><div style="flex:1;min-width:0"><div class="mw-row-t">${hi(e.title)}</div><div class="mw-em">${meta||''}${mwCatChip(cat)}</div>${snip?`<div class="mw-snip">${hi(snip)}</div>`:''}</div>${mwBadge(mwStatusOf(e))}</div>`;
+ return `<div class="mw-row" data-mwview="${w}|${e.id}"><span class="mw-dot" style="background:${cat.color}"></span><div style="flex:1;min-width:0"><div class="mw-row-t">${hi(e.title)}</div><div class="mw-em">${meta||''}${mwCatChip(cat)} ${mwProjChip(e)}</div>${snip?`<div class="mw-snip">${hi(snip)}</div>`:''}</div>${mwBadge(mwStatusOf(e))}</div>`;
 }
 
 function mwTimelineHTML(wk){
@@ -2207,7 +2268,7 @@ function mwSummaryHTML(wk){
  const w=wk.weekStart,es=[...wk.entries].sort(mwSortEntries),tot=mwCounts(es);
  const rows=mwEntryCats(wk).map(cid=>{const cat=mwCat(cid),c=mwCounts(es.filter(e=>e.categoryId===cid));
    return `<tr><td><span class="mw-dot" style="background:${cat.color};margin-right:7px"></span>${esc(cat.name)}${wk.categoryIds.includes(cid)?'':' <small>(removed from week)</small>'}</td><td>${c.total}</td><td>${c.Completed}</td><td>${c['In Progress']}</td><td>${c.Pending}</td><td>${c.Blocked}</td><td>${mwBadge(mwOverall(c))}</td></tr>`;}).join('');
- const item=(e,detail)=>`<div class="mw-sum-item"><div style="display:flex;gap:8px;align-items:flex-start"><div style="flex:1;min-width:0"><b>${esc(e.title)}</b><div class="mw-em">${mwDayLabel(e.date)} ${mwCatChip(mwCat(e.categoryId))}</div>${detail?`<div class="mw-snip">${esc(detail)}</div>`:''}</div><button class="mw-link" data-mwview="${w}|${e.id}">Open</button></div></div>`;
+ const item=(e,detail)=>`<div class="mw-sum-item"><div style="display:flex;gap:8px;align-items:flex-start"><div style="flex:1;min-width:0"><b>${esc(e.title)}</b><div class="mw-em">${mwDayLabel(e.date)} ${mwCatChip(mwCat(e.categoryId))} ${mwProjChip(e)}</div>${detail?`<div class="mw-snip">${esc(detail)}</div>`:''}</div><button class="mw-link" data-mwview="${w}|${e.id}">Open</button></div></div>`;
  const block=(icon,title,list,detailOf)=>`<div class="mw-sum-block"><h4>${icon} ${title} <span class="mw-em" style="margin:0">${list.length}</span></h4>${list.length?list.map(e=>item(e,detailOf(e))).join(''):'<div class="mw-snip" style="color:var(--ink-3)">None</div>'}</div>`;
  const st=s=>es.filter(e=>mwStatusOf(e)===s);
  return `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px"><div class="mw-sec-h" style="margin:0">Week ${mwWeekNo(w)} at a glance — ${mwCountsLine(tot)}</div><button class="btn sm primary" data-mwstandup>${svg('mic',14)} Prepare stand-up summary</button></div>
@@ -2248,7 +2309,7 @@ async function mwSearchHTML(qv){
  const weeks=await mwLoadAllWeeks();
  const hits=[];
  weeks.forEach(wk=>[...wk.entries].sort((a,b)=>mwSortEntries(b,a)).forEach(e=>{
-   const hay=[e.title,mwCat(e.categoryId).name,...['description',...MW_FIELDS.map(f=>f[0])].map(k=>mwPlain(e[k]))].join('\n').toLowerCase();
+   const hay=[e.title,e.project||'',mwCat(e.categoryId).name,...['description',...MW_FIELDS.map(f=>f[0])].map(k=>mwPlain(e[k]))].join('\n').toLowerCase();
    if(hay.includes(qv))hits.push({w:wk.weekStart,e});
  }));
  const catHits=mwCats.filter(c=>c.name.toLowerCase().includes(qv)||(c.description||'').toLowerCase().includes(qv));
@@ -2286,7 +2347,7 @@ async function mwEntryViewModal(w,eid,back){
  if(!e){toast('That entry no longer exists');if(back)back();return;}
  const secs=[['description','Work description'],...MW_FIELDS].map((f,i)=>`<div class="mw-sec"${i?'':' style="border-top:none;padding-top:0;margin-top:0"'}><div class="mw-sec-h">${f[1]}</div>${mwPlain(e[f[0]])?`<div class="rte-view">${mwSanitize(e[f[0]])}</div>`:'<div class="mw-snip" style="color:var(--ink-3)">—</div>'}</div>`).join('');
  const stamp=t=>t?new Date(t).toLocaleString():'';
- openModal(esc(e.title),`<div class="mw-em" style="margin:0 0 16px">${mwBadge(mwStatusOf(e))} ${mwCatChip(mwCat(e.categoryId))} ${mwDayLabel(e.date)} · Week ${mwWeekNo(w)}</div>${secs}
+ openModal(esc(e.title),`<div class="mw-em" style="margin:0 0 16px">${mwBadge(mwStatusOf(e))} ${mwCatChip(mwCat(e.categoryId))} ${mwProjChip(e)} ${mwDayLabel(e.date)} · Week ${mwWeekNo(w)}</div>${secs}
   ${e.createdAt?`<div class="mw-em" style="margin-top:16px">Recorded ${stamp(e.createdAt)}${e.updatedAt&&e.updatedAt-e.createdAt>1000?' · last edited '+stamp(e.updatedAt):''}</div>`:''}`,
   `${back?'<button class="btn" id="mwv-back" style="margin-right:auto">← Back</button>':''}${!back&&w!==mwUI.week?'<button class="btn" id="mwv-week" style="margin-right:auto">Open week</button>':''}<button class="btn" data-close>Close</button><button class="btn primary" id="mwv-edit">${svg('edit',15)} Edit</button>`,'wide');
  const bk=q('#mwv-back');if(bk)bk.onclick=back;
@@ -2308,11 +2369,13 @@ async function mwEntryModal(w,opts,afterSave){
  if(e.categoryId&&!inWeek.some(c=>c.id===e.categoryId)&&!others.some(c=>c.id===e.categoryId))inWeek.push(mwCat(e.categoryId));
  const opt=c=>`<option value="${c.id}" ${c.id===e.categoryId?'selected':''}>${esc(c.name)}</option>`;
  let status=mwStatusOf(e);
+ const projNames=await mwProjectNames();
  const open=MW_FIELDS.filter(f=>mwPlain(e[f[0]])).map(f=>f[0]);
  openModal(ex?'Edit work entry':'New work entry',`
   <input class="mw-title-in" id="mwe-title" placeholder="Activity title" value="${esc(e.title)}" maxlength="200">
-  <div class="row2">
+  <div class="row3">
    <div class="field"><label>Category</label><select id="mwe-cat">${e.categoryId?'':'<option value="">Choose a category…</option>'}${inWeek.length?`<optgroup label="This week">${inWeek.map(opt).join('')}</optgroup>`:''}${others.length?`<optgroup label="Other categories (adds it to this week)">${others.map(opt).join('')}</optgroup>`:''}</select></div>
+   <div class="field"><label>Project <span style="font-weight:500;color:var(--ink-3)">(optional)</span></label><input id="mwe-proj" list="mwe-projlist" value="${esc(e.project||'')}" placeholder="e.g. Gateway ECU" maxlength="80" autocomplete="off"><datalist id="mwe-projlist">${projNames.map(n=>`<option value="${esc(n)}"></option>`).join('')}</datalist></div>
    <div class="field"><label>Date performed</label><input type="date" id="mwe-date" value="${e.date}" min="${days[0]}" max="${days[6]}"></div>
   </div>
   <div class="field"><label>Status</label><div class="chips mw-stchips">${MW_STATUSES.map(s=>`<button type="button" class="chip ${s===status?'on':''}" data-mwst="${s}" style="${s===status?'background:'+MW_STATUS_COLOR[s]:''}">${s}</button>`).join('')}</div></div>
@@ -2336,7 +2399,7 @@ async function mwEntryModal(w,opts,afterSave){
    const catId=q('#mwe-cat').value;if(!catId){toast('Choose a category');return;}
    let date=q('#mwe-date').value;if(!days.includes(date))date=ex&&days.includes(ex.date)?ex.date:defDate;
    const now=Date.now();
-   const obj={...(ex||{}),id:ex?ex.id:id(),categoryId:catId,title,date,status,description:rteValue(body,'description'),createdAt:(ex&&ex.createdAt)||now,updatedAt:now};
+   const obj={...(ex||{}),id:ex?ex.id:id(),categoryId:catId,title,project:q('#mwe-proj').value.trim(),date,status,description:rteValue(body,'description'),createdAt:(ex&&ex.createdAt)||now,updatedAt:now};
    MW_FIELDS.forEach(f=>{obj[f[0]]=rteValue(body,f[0]);});
    const wk2=await mwGetWeek(w);
    const i=wk2.entries.findIndex(x=>x.id===obj.id);
@@ -2429,13 +2492,13 @@ async function mwSelectCatsModal(w,initial){
 
 /* ---- stand-up summary: every entry of the week lands in exactly one status bucket, so none can be dropped ---- */
 const MW_SU_SECTIONS=[
- ['done','Activities completed',e=>({lead:e.title})],
- ['prog','Activities in progress',e=>({lead:e.title})],
- ['pend','Pending activities',e=>({lead:e.title})],
- ['outcomes','Key outcomes & achievements',e=>({lead:e.title,detail:mwToText(e.outcome)})],
- ['findings','Technical findings',e=>({lead:e.title,detail:mwToText(e.findings)})],
- ['blockers','Blockers & challenges',e=>({lead:e.title+(mwStatusOf(e)==='Blocked'?' (blocked)':''),detail:mwToText(e.challenges)})],
- ['next','Planned next steps',e=>({lead:({'In Progress':'Continue: ','Pending':'Start: ','Blocked':'Resolve blocker: '}[mwStatusOf(e)]||'')+e.title})],
+ ['done','Activities completed',e=>({lead:mwSuTitle(e)})],
+ ['prog','Activities in progress',e=>({lead:mwSuTitle(e)})],
+ ['pend','Pending activities',e=>({lead:mwSuTitle(e)})],
+ ['outcomes','Key outcomes & achievements',e=>({lead:mwSuTitle(e),detail:mwToText(e.outcome)})],
+ ['findings','Technical findings',e=>({lead:mwSuTitle(e),detail:mwToText(e.findings)})],
+ ['blockers','Blockers & challenges',e=>({lead:mwSuTitle(e)+(mwStatusOf(e)==='Blocked'?' (blocked)':''),detail:mwToText(e.challenges)})],
+ ['next','Planned next steps',e=>({lead:({'In Progress':'Continue: ','Pending':'Start: ','Blocked':'Resolve blocker: '}[mwStatusOf(e)]||'')+mwSuTitle(e)})],
 ];
 const MW_SU_BUCKETS=['done','prog','pend','blocked'];
 function mwStandupData(wk){
@@ -2946,12 +3009,13 @@ function viewSettings(el){
     </div>
   `:`
     <p class="sub" style="margin-top:0">Log in to sync your plan across devices.</p>
-    <div class="field"><label>Email</label><input id="acc-email" type="email" placeholder="you@example.com"></div>
-    <div class="field"><label>Password</label><input id="acc-pass" type="password" placeholder="At least 8 characters"></div>
+    <div class="field"><label>Email</label><input id="acc-email" type="email" placeholder="you@example.com" value="${esc(authEmail)}" ${authBusy?'disabled':''}></div>
+    <div class="field"><label>Password</label><input id="acc-pass" type="password" placeholder="At least 8 characters" ${authBusy?'disabled':''}></div>
     <div id="acc-err" style="color:var(--red);font-size:12px;margin:-4px 0 8px;display:none"></div>
+    <div id="acc-note" class="sub" style="margin:-4px 0 8px;display:${authBusy?'block':'none'}">${authBusy?'Connecting to the sync server… if it has been idle for a while, this can take up to a minute. Please wait.':''}</div>
     <div style="display:flex;gap:8px">
-      <button class="btn primary" id="loginBtn" style="flex:1;justify-content:center">Log in</button>
-      <button class="btn" id="signupBtn" style="flex:1;justify-content:center">Sign up</button>
+      <button class="btn primary" id="loginBtn" style="flex:1;justify-content:center" ${authBusy?'disabled':''}>${authBusy==='login'?'Logging in…':'Log in'}</button>
+      <button class="btn" id="signupBtn" style="flex:1;justify-content:center" ${authBusy?'disabled':''}>${authBusy==='signup'?'Creating account…':'Sign up'}</button>
     </div>
   `}</div>
  </div></div>`;
@@ -2966,17 +3030,27 @@ function viewSettings(el){
    el.querySelector('#syncNowBtn').onclick=async()=>{toast('Syncing…');await syncNow();render();toast('Synced ✅');};
    el.querySelector('#logoutBtn').onclick=async()=>{await doLogout();render();toast('Logged out');};
  }else{
-   const showErr=(msg)=>{const e2=el.querySelector('#acc-err');e2.textContent=msg;e2.style.display='block';};
-   el.querySelector('#loginBtn').onclick=async()=>{
+   wakeSyncServer();
+   // only one auth request at a time: a Log in fired while a slow Sign up is still in flight reaches the
+   // server before the new account exists and gets "Incorrect email or password" for a perfectly good password
+   const runAuth=async(kind)=>{
+     if(authBusy)return;
      const email=el.querySelector('#acc-email').value.trim(),pass=el.querySelector('#acc-pass').value;
-     if(!email||!pass){showErr('Enter your email and password.');return;}
-     try{await doLogin(email,pass);render();toast('Logged in — syncing…');}catch(err){showErr(err.message);}
+     if(!email||!pass){const e2=el.querySelector('#acc-err');e2.textContent='Enter your email and password.';e2.style.display='block';return;}
+     authBusy=kind;authEmail=email;
+     if(view==='settings')render();
+     let err=null;
+     try{await (kind==='signup'?doRegister:doLogin)(email,pass);}catch(e){err=e;}
+     authBusy=null;
+     if(view==='settings')render();
+     if(!err){authEmail='';toast(kind==='signup'?'Account created — syncing in the background':'Logged in — syncing in the background');return;}
+     const msg=err.status===409?'An account with that email already exists — use Log in instead.':err.status===429?'Too many attempts — wait a few minutes and try again.':err.message;
+     const e2=document.getElementById('acc-err');
+     if(e2){e2.textContent=msg;e2.style.display='block';}else toast(msg);
    };
-   el.querySelector('#signupBtn').onclick=async()=>{
-     const email=el.querySelector('#acc-email').value.trim(),pass=el.querySelector('#acc-pass').value;
-     if(!email||!pass){showErr('Enter your email and password.');return;}
-     try{await doRegister(email,pass);render();toast('Account created — syncing…');}catch(err){showErr(err.message);}
-   };
+   el.querySelector('#loginBtn').onclick=()=>runAuth('login');
+   el.querySelector('#signupBtn').onclick=()=>runAuth('signup');
+   el.querySelector('#acc-pass').onkeydown=e=>{if(e.key==='Enter')runAuth('login');};
  }
 }
 function wireSleep(el){const sv=el.querySelector('#saveSleep');if(sv)sv.onclick=()=>{pref.wakeTime=el.querySelector('#wakeT').value||'07:00';pref.sleepHours=num(el.querySelector('#sleepH').value)||8;queueSave();render();toast('Sleep plan saved');};}
