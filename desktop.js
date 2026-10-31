@@ -85,6 +85,7 @@
     const inp = $('#cmdkIn'); inp.value = ''; cmdSel = 0; renderPalette(''); setTimeout(() => inp.focus(), 40);
   }
   function closePalette() { ov.classList.remove('show'); }
+  window.openPalette = openPalette;
   function renderPalette(q) {
     const all = commands();
     const ql = q.trim().toLowerCase();
@@ -92,7 +93,7 @@
     if (cmdSel >= cmdItems.length) cmdSel = 0;
     const list = $('#cmdkList');
     list.innerHTML = cmdItems.length
-      ? cmdItems.map((c, i) => `<div class="cmdk-row ${i === cmdSel ? 'sel' : ''}" data-i="${i}"><span class="ci">${ico(c.ic, 15)}</span>${c.t}${c.kb ? `<span class="kb">${c.kb}</span>` : ''}</div>`).join('')
+      ? cmdItems.map((c, i) => `<div class="cmdk-row ${i === cmdSel ? 'sel' : ''}" data-i="${i}"><span class="ci">${ico(c.ic, 15)}</span>${esc(c.t)}${c.kb ? `<span class="kb">${c.kb}</span>` : ''}</div>`).join('')
       : '<div class="cmdk-empty">No matching command</div>';
     list.querySelectorAll('[data-i]').forEach(r => r.onclick = () => runCmd(+r.dataset.i));
   }
@@ -203,11 +204,12 @@
       const [st_, en] = interval(a);
       if (n > en && n - en <= 1 && !fired[keyO]) { fired[keyO] = 1; notify('Overdue: ' + a.title, 'Mark it done, skipped, or postpone it.'); }
     });
-    // bedtime reminder
+    // bedtime reminder — keyed per date, since the app usually stays running in the tray for days
     const bed = toMin(toHM(toMin(pref.wakeTime || '07:00') - (pref.sleepHours || 8) * 60));
-    if (n === Math.max(0, bed - 15) && !fired['bed']) { fired['bed'] = 1; notify('Bedtime in 15 minutes', pref.noPhoneSleep ? 'Wind down and put the phone away.' : 'Time to wind down.'); }
+    const keyBed = 'bed:' + dayStr, keyScreen = 'screen:' + dayStr;
+    if (n === (bed - 15 + 1440) % 1440 && !fired[keyBed]) { fired[keyBed] = 1; notify('Bedtime in 15 minutes', pref.noPhoneSleep ? 'Wind down and put the phone away.' : 'Time to wind down.'); }
     // screen-time warning
-    if ((day.screenMin || 0) > (pref.phoneTarget || 120) && !fired['screen']) { fired['screen'] = 1; notify('Screen-time limit reached', `You've passed your ${((pref.phoneTarget || 120) / 60).toFixed(0)}h daily target.`, true); }
+    if ((day.screenMin || 0) > (pref.phoneTarget || 120) && !fired[keyScreen]) { fired[keyScreen] = 1; notify('Screen-time limit reached', `You've passed your ${((pref.phoneTarget || 120) / 60).toFixed(0)}h daily target.`, true); }
   }, 30000);
 
   /* ---------- Automatic screen time (desktop only) ---------- */
@@ -242,8 +244,9 @@
       <div class="sub">Added straight to today's timeline.</div>`,
       `<button class="btn" data-close>Cancel</button><button class="btn primary" id="qc-save">Add to today</button>`);
     const q2 = (s) => document.querySelector('#overlay ' + s);
-    q2('#qc-save').onclick = () => {
+    q2('#qc-save').onclick = async () => {
       const t = q2('#qc-title').value.trim(); if (!t) { toast('Add a title'); return; }
+      if (dayStr !== todayStr()) await loadDay(todayStr()); // "today's timeline", even if another date is on screen
       day.activities.push({ id: id(), title: t, icon: 'tag', color: '#6366f1', start: q2('#qc-start').value, end: q2('#qc-end').value, status: 'pending', goalId: null });
       day.planned = true; queueSave(); render(); closeModal(); toast('Added to today');
     };

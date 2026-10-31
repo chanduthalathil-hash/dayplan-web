@@ -2,7 +2,7 @@
 
 Browser build of [DayPlan](https://github.com/chanduthalathil-hash/dayplan-desktop). Same UI and the same account, synced through [dayplan-server](https://github.com/chanduthalathil-hash/dayplan-server) — log in with your desktop app's email/password and your plan, habits, goals and work tasks appear here too.
 
-This is a static copy of `dayplan-desktop/renderer/{index.html,desktop.js}` with no Electron dependency:
+This is a static copy of `dayplan-desktop/renderer/{index.html,desktop.js,assets/}` with no Electron dependency:
 
 - No account / not logged in → data is kept in this browser's `localStorage` only (per browser, per device).
 - Logged in → synced privately through the Render/Turso backend, same as the desktop app.
@@ -15,6 +15,7 @@ Whenever `dayplan-desktop/renderer/index.html` or `desktop.js` change, copy them
 ```
 cp ../dayplan-desktop/renderer/index.html .
 cp ../dayplan-desktop/renderer/desktop.js .
+mkdir -p assets && cp ../dayplan-desktop/renderer/assets/* assets/
 git add -A && git commit -m "Sync from dayplan-desktop" && git push
 ```
 
