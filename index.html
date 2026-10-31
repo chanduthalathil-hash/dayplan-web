@@ -713,7 +713,7 @@ const hasStore=(typeof window!=='undefined')&&window.storage&&typeof window.stor
 // plain-browser (non-Electron, no host `window.storage`) persistence — lets the same renderer
 // run as a regular web page and still keep data across reloads via the browser's own localStorage
 const hasLocal=(()=>{try{return !DESK&&!hasStore&&typeof localStorage!=='undefined'&&!!localStorage;}catch(e){return false;}})();
-const DB={
+const RAW={
  async get(k){
    if(DESK){try{const v=await DESK.store.get(k);if(v!=null)return v;}catch(e){}}
    else if(hasStore){try{const r=await window.storage.get(k,false);if(r&&r.value!=null)return JSON.parse(r.value);}catch(e){}}
@@ -741,9 +741,47 @@ const DB={
    return true;
  },
 };
+/* Each account's data has its own slot on the device — 'u<userId>|dp:…' while signed in, 'guest|dp:…' while
+   signed out — so two people sharing a computer never see each other's plans, and signing out shows a clean app.
+   The rest of the app (and sync) keeps using plain 'dp:…' keys through DB, which adds the current slot; the
+   server already stores each account's rows separately, so what gets synced is unchanged. Only the device-wide
+   settings below stay outside every slot. */
+const GLOBAL_KEYS=['dp:account','dp:minimizeToTray'];
+const GUEST_NS='guest|',LEGACY_NS='legacy|',FLASH_KEY='dpFlash';
+let NS=GUEST_NS;
+const nsKey=k=>k.startsWith('dp:')&&!GLOBAL_KEYS.includes(k)?NS+k:k;
+const DB={
+ get:k=>RAW.get(nsKey(k)),
+ set:(k,v)=>RAW.set(nsKey(k),v),
+ delete:k=>RAW.delete(nsKey(k)),
+ async list(p){return (await RAW.list(NS+(p||''))).map(k=>k.slice(NS.length));},
+};
+async function wipeNs(ns){for(const k of await RAW.list(ns))await RAW.delete(k);}
+function jwtUid(token){try{const p=JSON.parse(atob(String(token).split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));return p.uid!=null?String(p.uid):null;}catch(e){return null;}}
+function nsFor(acc){return 'u'+(acc.uid||String(acc.email).toLowerCase())+'|';}
+/* DayPlan 1.0.21 and earlier kept one shared, unprefixed set of keys. Signed in, that set was this account's
+   (it synced with it), so it moves into the account's slot. Signed out, nobody can tell whose it is, so it is
+   locked away out of sight and only offered — with a question — to the next account that signs in. */
+async function lockAwayLegacyData(){
+ const keys=(await RAW.list('dp:')).filter(k=>!GLOBAL_KEYS.includes(k));
+ const dest=account?NS:LEGACY_NS;
+ for(const k of keys){const v=await RAW.get(k);if(v!=null&&await RAW.get(dest+k)==null)await RAW.set(dest+k,v);await RAW.delete(k);}
+}
 const dayKey=d=>'dp:day:'+d;
-let pref=null,day=null,dayStr=null,view='today',saveTimer=null,focusState=null,focusTimer=null;
-function queueSave(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>{DB.set(dayKey(dayStr),day);DB.set(PREF,pref);scheduleSync();},220);}
+let pref=null,day=null,dayStr=null,view='today',saveTimer=null,focusState=null,focusTimer=null,leaving=false;
+function queueSave(){if(leaving)return;clearTimeout(saveTimer);saveTimer=setTimeout(()=>{DB.set(dayKey(dayStr),day);DB.set(PREF,pref);scheduleSync();},220);}
+async function flushSave(){if(leaving)return;clearTimeout(saveTimer);if(dayStr&&day)await DB.set(dayKey(dayStr),day);if(pref)await DB.set(PREF,pref);}
+/* switching slot (sign in / out / expired session): stop everything still running for the old one, then reload
+   so every in-memory cache, timer and reminder starts again from the new slot */
+async function leaveTo(flash,flush){
+ if(flush)await flushSave();
+ leaving=true;clearTimeout(saveTimer);clearTimeout(syncDebounce);
+ if(focusTimer)clearInterval(focusTimer);focusState=null;
+ if(DESK){try{DESK.focusState({running:false,left:0,total:0,title:''});DESK.miniClose();}catch(e){}}
+ if(flash)await RAW.set(FLASH_KEY,flash);
+ location.reload();
+ return new Promise(()=>{});
+}
 function id(){return Math.random().toString(36).slice(2,9);}
 
 /* ============ Cloud sync ============ */
@@ -755,7 +793,7 @@ let syncState={pushed:{},lastPulledAt:0,syncing:false};
 let syncDebounce=null;
 
 function syncEnabled(){return !!(account&&account.token);}
-function scheduleSync(){if(!syncEnabled())return;clearTimeout(syncDebounce);syncDebounce=setTimeout(syncNow,3000);}
+function scheduleSync(){if(!syncEnabled()||leaving)return;clearTimeout(syncDebounce);syncDebounce=setTimeout(syncNow,3000);}
 
 async function apiFetch(path,opts){
  opts=opts||{};
@@ -779,21 +817,15 @@ async function doLogin(email,password){
  await startSession(r);
  return r;
 }
-/* the account is usable as soon as the server answers — the first full sync can take a while (it pushes
-   every local key), so it runs in the background instead of holding the login screen hostage until it ends */
+/* the guest slot's pending edits are saved first; the account's own slot then loads and syncs in the background */
 async function startSession(r){
- account={email:r.email,token:r.token};await DB.set(ACCOUNT_KEY,account);
- const owner=await DB.get(OWNER_KEY),me=String(r.email).toLowerCase();
- if(owner&&owner!==me){await wipeLocalData();await DB.set(OWNER_KEY,me);location.reload();return;}
- await DB.set(OWNER_KEY,me);
- syncState={pushed:{},lastPulledAt:0,syncing:false};
- teamsLoaded=false;
- syncNow().then(()=>{if(view==='settings')render();});
+ await flushSave();
+ await RAW.set(ACCOUNT_KEY,{email:r.email,token:r.token,uid:jwtUid(r.token)});
+ return leaveTo('Logged in as '+r.email);
 }
 /* Render's free plan sleeps the server after ~15 idle minutes and the first request then waits ~30–60s for it
    to boot — pinging health as soon as the login form shows starts that boot while the user is still typing */
-let authBusy=null,authEmail='',authName='',authMode='login',serverWoken=false;
-const PENDING_NAME_KEY='dpPendingName';
+let authBusy=null,authEmail='',authMode='login',serverWoken=false;
 function wakeSyncServer(){if(serverWoken)return;serverWoken=true;fetch(SYNC_API+'/api/health').catch(()=>{serverWoken=false;});}
 /* sign-in on a just-woken free-tier server: while it boots, Render answers 502/503/504 or drops the
    connection, so those are retried for up to ~90s; each try is capped so a hung request can't freeze the form */
@@ -808,28 +840,21 @@ async function authFetch(path,body){
    await new Promise(r=>setTimeout(r,wait));wait=Math.min(wait*1.5,8000);
  }
 }
-/* which account the data on this device belongs to — deliberately not a 'dp:' key, so it is never synced */
-const OWNER_KEY='dpOwner';
-const DEVICE_KEYS=['dp:minimizeToTray'];
-async function wipeLocalData(){
- clearTimeout(saveTimer);clearTimeout(syncDebounce);
- const keys=await DB.list('dp:');
- for(const k of keys)if(k!==ACCOUNT_KEY&&!DEVICE_KEYS.includes(k))await DB.delete(k);
-}
-/* everything is uploaded first, then this device's copy is erased so the next person to use the app
-   (or log in) sees none of it; it comes back from the server on the next login */
+/* everything is uploaded first, then the account's slot on this device is erased (it comes back from the
+   server on the next login) and the app reopens signed out, in the clean guest slot */
 async function doLogout(){
- clearTimeout(saveTimer);await DB.set(dayKey(dayStr),day);await DB.set(PREF,pref);
+ await flushSave();
  while(syncState.syncing)await new Promise(r=>setTimeout(r,200));
- if(!await syncNow()){
-   if(!account){render();throw new Error('Your session expired. Log in again to save your latest changes, then log out.');}
-   throw new Error("Couldn't upload your latest changes, so you're still logged in and nothing was removed. Check your connection and try again.");
- }
- account=null;await DB.delete(ACCOUNT_KEY);await DB.delete(OWNER_KEY);
- syncState={pushed:{},lastPulledAt:0,syncing:false};
- myTeams=[];teamStateCache={};teamsLoaded=false;
- await wipeLocalData();
- location.reload();
+ if(!await syncNow())throw new Error("Couldn't upload your latest changes, so you're still logged in and nothing was removed. Check your connection and try again.");
+ const ns=NS;leaving=true;
+ await RAW.delete(ACCOUNT_KEY);await wipeNs(ns);
+ return leaveTo('Logged out');
+}
+/* an expired session signs out but keeps the account's slot, so changes not yet synced survive until the
+   same account signs in again; nobody else can see that slot in the meantime */
+async function sessionExpired(){
+ await RAW.delete(ACCOUNT_KEY);
+ return leaveTo('Your session expired — log in again to keep syncing. Your data is kept for when you do.',true);
 }
 
 /* ============ Team collaboration (server-backed, separate from the private per-account sync above) ============
@@ -928,7 +953,7 @@ async function syncRound(pullOnly){
      if(c.key===dayKey(dayStr))touchedCurrent=true;
    }else{
      const parsed=JSON.parse(c.value);
-     await DB.set(c.key,parsed);syncState.pushed[c.key]=c.value;
+     await DB.set(c.key,parsed);syncState.pushed[c.key]=c.value;freshKeys.delete(c.key);
      if(c.key.startsWith('dp:mw:')){mwInvalidate();if(view==='work')touchedCurrent=true;}
      if(c.key===PREF){pref=parsed;touchedCurrent=true;}
      else if(c.key===dayKey(dayStr)){day=parsed;touchedCurrent=true;}
@@ -939,7 +964,7 @@ async function syncRound(pullOnly){
  return touchedCurrent;
 }
 async function syncNow(){
- if(!syncEnabled()||syncState.syncing)return false;
+ if(!syncEnabled()||syncState.syncing||leaving||importPending)return false;
  syncState.syncing=true;let ok=false;
  try{
    // always pull and merge remote changes BEFORE computing what to push. A day's data is synced
@@ -952,13 +977,95 @@ async function syncNow(){
    if(touchedCurrent&&typeof render==='function')render();
    ok=true;
  }catch(e){
-   if(e.status===401){account=null;await DB.delete(ACCOUNT_KEY);toast('Sync session expired — please log in again.');}
+   if(e.status===401){syncState.syncing=false;await sessionExpired();}
    console.error('sync failed',e);
  }
  syncState.syncing=false;
  return ok;
 }
 setInterval(()=>{if(syncEnabled())syncNow();},120000);
+
+/* ============ Data on this device that no account owns ============
+   Old shared data (locked away by lockAwayLegacyData) and anything made while signed out (the guest slot) is
+   never attached to an account silently: the account that signs in is asked, and on "Don't import" it is
+   deleted. Closing the question decides nothing and it comes back next time. */
+let importPending=false,importedName='';
+const freshKeys=new Set(); // keys this launch created from defaults and the server hasn't replaced yet
+const PREF_LISTS=['templates','goals','habits','workTasks','workProjects','recurringTasks'];
+async function deviceDataSummary(ns){
+ let days=0,entries=0;
+ for(const full of await RAW.list(ns)){
+   const k=full.slice(ns.length),v=await RAW.get(full);if(!v)continue;
+   if(k.startsWith('dp:day:')&&(v.planned||v.note||v.review||v.focusMin||(v.activities||[]).some(a=>a.status!=='pending')))days++;
+   if(k.startsWith('dp:mw:week:'))entries+=(v.entries||[]).length;
+ }
+ const p=await RAW.get(ns+PREF)||{};
+ const s={days,entries,work:(p.workTasks||[]).length,checkins:(p.habits||[]).reduce((n,h)=>n+Object.keys(h.history||{}).length,0),blocks:(p.templates||[]).length};
+ // untouched defaults (a fresh guest slot, the generic routine) don't count as data worth asking about
+ s.any=!!(s.days||s.entries||s.work||s.checkins||p.name);
+ return s;
+}
+function importModal(srcs){
+ return new Promise(res=>{
+   const t={};srcs.forEach(x=>['days','work','entries','checkins','blocks'].forEach(k=>t[k]=(t[k]||0)+x[k]));
+   const lines=[[t.days,'day','days','of plans and check-offs'],[t.blocks,'planner block','planner blocks',''],[t.work,'work task','work tasks',''],[t.entries,'My Work journal entry','My Work journal entries',''],[t.checkins,'habit check-in','habit check-ins','']]
+     .filter(l=>l[0]).map(l=>`<li>${l[0]} ${l[0]===1?l[1]:l[2]} ${l[3]}</li>`).join('');
+   openModal('Import data from this device?',`<p style="margin-top:0">This device has DayPlan data that isn't linked to any account:</p><ul style="margin:0 0 12px;padding-left:20px;line-height:1.7">${lines}</ul>
+     <p>Import it into <b>${esc(account.email)}</b>? It's added alongside what the account already has.</p><p class="sub" style="margin:0">If it isn't yours, choose <b>Don't import</b> and it's deleted from this device.</p>`,
+     `<button class="btn" id="imNo">Don't import</button><button class="btn primary" id="imYes">Import</button>`);
+   let done=false;const fin=v=>{if(done)return;done=true;obs.disconnect();closeModal();res(v);};
+   const obs=new MutationObserver(()=>{if(!overlay.classList.contains('show'))fin(null);});
+   obs.observe(overlay,{attributes:true,attributeFilter:['class']});
+   overlay.querySelector('#imYes').onclick=()=>fin(true);
+   overlay.querySelector('#imNo').onclick=()=>fin(false);
+ });
+}
+const unionById=(a,b)=>{a=a||[];const ids=new Set(a.map(x=>x&&x.id));return a.concat((b||[]).filter(x=>x&&!ids.has(x.id)));};
+/* adds the source slot to the account: anything the account lacks is copied; lists are combined by id;
+   a day or item the account already has keeps the account's version */
+async function mergeNamespace(src){
+ for(const full of await RAW.list(src)){
+   const k=full.slice(src.length),v=await RAW.get(full);if(v==null)continue;
+   const cur=freshKeys.has(k)?null:await DB.get(k);
+   if(cur==null){if(k===PREF)importedName=v.name||'';await DB.set(k,k===PREF?{...v,name:pref&&pref.name||''}:v);freshKeys.delete(k);continue;}
+   if(k===PREF){PREF_LISTS.forEach(l=>{cur[l]=unionById(cur[l],v[l]);});await DB.set(k,cur);}
+   else if(k==='dp:mw:cats'&&Array.isArray(cur))await DB.set(k,unionById(cur,v));
+   else if(k.startsWith('dp:mw:week:')){cur.entries=unionById(cur.entries,v.entries);cur.categoryIds=[...new Set([...(cur.categoryIds||[]),...(v.categoryIds||[])])];await DB.set(k,cur);}
+ }
+}
+/* runs once the app has opened in a signed-in account's slot */
+async function accountStartup(){
+ const srcs=[];
+ for(const ns of [LEGACY_NS,GUEST_NS]){const x=await deviceDataSummary(ns);if(x.any)srcs.push({ns,...x});else await wipeNs(ns);}
+ if(srcs.length){
+   importPending=true;
+   const yes=await importModal(srcs);
+   if(yes===true){
+     // the account's own data is pulled first, so "the account already has it" is judged against the server
+     let pulled=false;syncState.syncing=true;
+     try{await syncRound(true);pulled=true;}catch(e){console.error('import pull failed',e);if(e.status===401){syncState.syncing=false;return sessionExpired();}}
+     syncState.syncing=false;
+     if(pulled){
+       for(const x of srcs){await mergeNamespace(x.ns);await wipeNs(x.ns);}
+       pref=await DB.get(PREF)||pref;day=await DB.get(dayKey(dayStr))||day;mwInvalidate();
+       toast('Imported into your account');
+     }else toast("Can't reach the sync server — you'll be asked about importing again next time.");
+   }else if(yes===false){for(const x of srcs)await wipeNs(x.ns);toast("Deleted — it wasn't imported");}
+   importPending=false;render();
+ }
+ // only after a successful sync: offline, the account's saved name simply hasn't arrived yet
+ if(await syncNow()&&!String(pref.name||'').trim())nameOnboarding(importedName);
+}
+function nameOnboarding(prefill){
+ openModal('What should we call you?',`<p class="sub" style="margin-top:0">DayPlan uses it to greet you. You can change it any time in Settings.</p>
+   <div class="field"><label>Your name</label><input id="ob-name" maxlength="40" placeholder="e.g. Priya" value="${esc(prefill||'')}"></div>
+   <div id="ob-err" style="color:var(--red);font-size:12px;display:none">Enter a name, or choose Later.</div>`,
+   `<button class="btn" data-close>Later</button><button class="btn primary" id="ob-save">Continue</button>`);
+ const save=()=>{const v=overlay.querySelector('#ob-name').value.trim();if(!v){overlay.querySelector('#ob-err').style.display='block';return;}
+   pref.name=v;queueSave();closeModal();render();toast('Welcome, '+displayName()+'!');};
+ overlay.querySelector('#ob-save').onclick=save;
+ overlay.querySelector('#ob-name').onkeydown=e=>{if(e.key==='Enter')save();};
+}
 
 /* ============ Time helpers ============ */
 const DAYNAMES=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -1008,7 +1115,7 @@ function freeSlots(acts){
 }
 
 /* ============ Stats ============ */
-function displayName(){return (String(pref&&pref.name||'').trim()||'User').split(/\s+/)[0];}
+function displayName(){return String(pref&&pref.name||'').trim().split(/\s+/)[0];}
 function dayStats(d,ds){
  ds=ds||dayStr;
  const acts=d.activities||[];const total=acts.length||1;
@@ -1047,15 +1154,18 @@ async function loadDay(ds){
 function render(){
  if(!day)day={planned:false,activities:generateActivities(dayStr||todayStr()),priorities:[],focusMin:0,screenMin:0,review:null};
  const h=new Date().getHours(),g=h<12?'Good morning':h<17?'Good afternoon':'Good evening';
- document.getElementById('greeting').textContent={planner:'🗓️ Planner',analytics:'📊 Analytics',calendar:'📅 Calendar',notes:'📝 Notes',settings:'⚙️ Settings'}[view]||(g+', '+displayName()+'! 👋');
+ document.getElementById('greeting').textContent={planner:'🗓️ Planner',analytics:'📊 Analytics',calendar:'📅 Calendar',notes:'📝 Notes',settings:'⚙️ Settings'}[view]||(g+(displayName()?', '+displayName():'')+'! 👋');
  document.getElementById('dateLabel').textContent=dateLabel(dayStr);
  document.body.classList.toggle('own-head',['today','habits','goals','work'].includes(view));
  const who=displayName();
- document.getElementById('avatarInit').textContent=who.charAt(0).toUpperCase();
- document.getElementById('avatarName').textContent=who;
+ document.getElementById('avatarInit').innerHTML=who?esc(who.charAt(0).toUpperCase()):svg('smile',18);
+ document.getElementById('avatarName').textContent=who||(account?'Account':'Log in');
  document.getElementById('bell').textContent=upcomingList(true).length||'';
  document.getElementById('viewSub').textContent={today:"Let's plan your amazing day",planner:'Manage your routine & recurring blocks',work:'Plan work. Schedule time. Get things done.',habits:'Build streaks that compound',goals:'Connect daily actions to long-term goals',analytics:'See if you actually follow your plan',calendar:'Jump to any day',notes:'Capture thoughts for the day',settings:'Sleep, phone limits & preferences'}[view]||'';
- ({today:viewToday,planner:viewPlanner,work:viewWork,habits:viewHabits,goals:viewGoals,analytics:viewAnalytics,calendar:viewCalendar,notes:viewNotes,settings:viewSettings}[view]||viewToday)(document.getElementById('content'));
+ // each render draws into a fresh container: a slower async view (Today, Work…) still loading when the user has
+ // already moved on then finishes into a detached element instead of overwriting the tab now on screen
+ const host=document.createElement('div');document.getElementById('content').replaceChildren(host);
+ ({today:viewToday,planner:viewPlanner,work:viewWork,habits:viewHabits,goals:viewGoals,analytics:viewAnalytics,calendar:viewCalendar,notes:viewNotes,settings:viewSettings}[view]||viewToday)(host);
 }
 
 /* ---- helpers for widgets ---- */
@@ -1176,7 +1286,7 @@ async function viewToday(el){
  const cont=document.createElement('div');
  cont.innerHTML=`
  <div class="hero">
-   <h2>${g}, ${esc(who)} 👋</h2>
+   <h2>${g}${who?', '+esc(who):''} 👋</h2>
    <div class="hq">“${quote}”</div>
    ${day.planned?`<button class="hero-pill" id="heroFocus">${svg('goal',17)} Focus on what matters today.</button>`
      :`<button class="hero-pill plan" id="planDayBtn">${svg('sun',17)} Plan My Day — ${(day.activities||[]).length} blocks ready for ${DAYNAMES[dowOf(dayStr)]} →</button>`}
@@ -3124,7 +3234,7 @@ function editSharedRecurringModal(teamId,rtId){
 /* ============ VIEW: Settings ============ */
 function viewSettings(el){
  el.innerHTML=`<div class="grid"><div class="col"><div class="card"><div class="card-head"><h3>Profile & focus</h3></div>
-   <div class="field"><label>Your name</label><input id="s-name" value="${esc(pref.name)}" placeholder="User"></div>
+   <div class="field"><label>Your name</label><input id="s-name" value="${esc(pref.name)}" placeholder="Add your name"></div>
    <div class="row2"><div class="field"><label>Focus session length (min)</label><input id="s-focus" inputmode="numeric" value="${pref.focusLen||60}"></div><div class="field"><label>Daily focus goal (h)</label><input id="s-fg" inputmode="numeric" value="${pref.focusGoalH||4}"></div></div>
    <button class="btn primary" id="s-save">Save</button></div>
   <div class="card"><div class="card-head"><h3>Sleep planner</h3></div>${sleepBox()}</div></div>
@@ -3144,7 +3254,6 @@ function viewSettings(el){
     </div>
   `:`
     <p class="sub" style="margin-top:0">${authMode==='signup'?'Create an account to sync your plan across devices.':'Log in to sync your plan across devices.'}</p>
-    ${authMode==='signup'?`<div class="field"><label>Your name</label><input id="acc-name" placeholder="How should DayPlan greet you?" value="${esc(authName)}" ${authBusy?'disabled':''}></div>`:''}
     <div class="field"><label>Email</label><input id="acc-email" type="email" placeholder="you@example.com" value="${esc(authEmail)}" ${authBusy?'disabled':''}></div>
     <div class="field"><label>Password</label><input id="acc-pass" type="password" placeholder="At least 8 characters" ${authBusy?'disabled':''}></div>
     <div id="acc-err" style="color:var(--red);font-size:12px;margin:-4px 0 8px;display:none"></div>
@@ -3170,27 +3279,22 @@ function viewSettings(el){
    const runAuth=async(kind)=>{
      if(authBusy)return;
      const email=el.querySelector('#acc-email').value.trim(),pass=el.querySelector('#acc-pass').value;
-     const nm=el.querySelector('#acc-name');if(nm)authName=nm.value.trim();
      const bad=m=>{const e2=el.querySelector('#acc-err');e2.textContent=m;e2.style.display='block';};
-     if(kind==='signup'&&!authName)return bad('Enter your name.');
      if(!email||!pass)return bad('Enter your email and password.');
      if(kind==='signup'&&pass.length<8)return bad('Password must be at least 8 characters.');
-     // survives the reload that happens when a different account's data has to be cleared first
-     if(kind==='signup')await DB.set(PENDING_NAME_KEY,authName);
      authBusy=kind;authEmail=email;
      if(view==='settings')render();
      let err=null;
      try{await (kind==='signup'?doRegister:doLogin)(email,pass);}catch(e){err=e;}
      authBusy=null;
      if(view==='settings')render();
-     if(!err){if(kind==='signup'){pref.name=authName;await DB.delete(PENDING_NAME_KEY);queueSave();}authEmail='';authName='';authMode='login';render();toast(kind==='signup'?'Welcome, '+displayName()+'! Account created':'Logged in — syncing in the background');return;}
-     if(kind==='signup')await DB.delete(PENDING_NAME_KEY);
+     if(!err)return; // success reopens the app in the account's slot
      const msg=err.status===409?'An account with that email already exists — use Log in instead.':err.status===429?'Too many attempts — wait a few minutes and try again.':err.message;
      const e2=document.getElementById('acc-err');
      if(e2){e2.textContent=msg;e2.style.display='block';}else toast(msg);
    };
    el.querySelector('#authBtn').onclick=()=>runAuth(authMode);
-   el.querySelector('#authSwitch').onclick=()=>{const nm=el.querySelector('#acc-name');if(nm)authName=nm.value;authEmail=el.querySelector('#acc-email').value;authMode=authMode==='signup'?'login':'signup';render();};
+   el.querySelector('#authSwitch').onclick=()=>{authEmail=el.querySelector('#acc-email').value;authMode=authMode==='signup'?'login':'signup';render();};
    el.querySelector('#acc-pass').onkeydown=e=>{if(e.key==='Enter')runAuth(authMode);};
  }
 }
@@ -3358,6 +3462,12 @@ function defaultTemplates(){
 }
 async function init(){
  buildNav();
+ account=await RAW.get(ACCOUNT_KEY);
+ if(account&&!account.token)account=null;
+ if(account&&!account.uid){const uid=jwtUid(account.token);if(uid){account.uid=uid;await RAW.set(ACCOUNT_KEY,account);}}
+ NS=account?nsFor(account):GUEST_NS;
+ await lockAwayLegacyData();
+ await RAW.delete('dpOwner');await RAW.delete('dpPendingName'); // markers from 1.0.21
  pref=await DB.get(PREF);
  if(!pref){
    pref={name:'',dark:false,wakeTime:'07:00',sleepHours:8,phoneTarget:120,focusLen:60,focusGoalH:4,noPhoneSleep:true,notify:false,
@@ -3382,6 +3492,7 @@ async function init(){
    day={planned:false,activities:generateActivities(today),priorities:[],focusMin:0,screenMin:0,review:null};
    await DB.set(dayKey(today),day);
    await DB.set(PREF,pref);
+   freshKeys.add(PREF);freshKeys.add(dayKey(today));
  }else{
    dayStr=pref.lastDay&&pref.lastDay>=addDays(todayStr(),-30)?pref.lastDay:todayStr();
    day=await DB.get(dayKey(dayStr));
@@ -3389,12 +3500,9 @@ async function init(){
  }
  applyDark();
  setView('today');
- const pendingName=await DB.get(PENDING_NAME_KEY);
- if(pendingName){if(!pref.name){pref.name=pendingName;queueSave();render();}await DB.delete(PENDING_NAME_KEY);}
+ const flash=await RAW.get(FLASH_KEY);if(flash){await RAW.delete(FLASH_KEY);toast(flash);}
  wakeSyncServer();
- account=await DB.get(ACCOUNT_KEY);
- if(account&&account.email&&!await DB.get(OWNER_KEY))await DB.set(OWNER_KEY,String(account.email).toLowerCase());
- if(syncEnabled())syncNow();
+ if(syncEnabled())accountStartup();
 }
 init();
 </script>
