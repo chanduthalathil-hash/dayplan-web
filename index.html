@@ -212,8 +212,9 @@ body.own-head .page-head{display:none}
 .delta.up{background:#fee2e2;color:#dc2626}.delta.down{background:var(--green-tint);color:var(--green-600)}
 body.dark .delta.up{background:#3a1414}
 /* timeline cards tinted by their activity's colour */
-.act{border:1px solid color-mix(in srgb,var(--ac,#94a3b8) 22%,var(--line));background:color-mix(in srgb,var(--ac,#94a3b8) 6%,var(--card));padding:12px 14px;border-radius:14px}
-.act:hover{border-color:color-mix(in srgb,var(--ac,#94a3b8) 45%,var(--line));box-shadow:var(--shadow)}
+.act{padding:12px 14px;border-radius:14px}
+.act:hover{box-shadow:var(--shadow)}
+.act.done{border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.10)}
 .act .aic{width:42px;height:42px;flex:0 0 42px;border-radius:12px;background:var(--card)!important;box-shadow:0 1px 3px rgba(15,23,42,.08)}
 .act .an{font-size:14px}
 .act .at{font-size:12px}
@@ -766,12 +767,15 @@ async function apiFetch(path,opts){
  return body;
 }
 async function doRegister(email,password){
- const r=await apiFetch('/api/auth/register',{method:'POST',body:JSON.stringify({email,password})});
+ let r;
+ // a retried sign-up whose first attempt did reach the server finds its own new account already there
+ try{r=await authFetch('/api/auth/register',{email,password});}
+ catch(e){if(e.status===409&&e.retried)r=await authFetch('/api/auth/login',{email,password});else throw e;}
  await startSession(r);
  return r;
 }
 async function doLogin(email,password){
- const r=await apiFetch('/api/auth/login',{method:'POST',body:JSON.stringify({email,password})});
+ const r=await authFetch('/api/auth/login',{email,password});
  await startSession(r);
  return r;
 }
@@ -779,18 +783,53 @@ async function doLogin(email,password){
    every local key), so it runs in the background instead of holding the login screen hostage until it ends */
 async function startSession(r){
  account={email:r.email,token:r.token};await DB.set(ACCOUNT_KEY,account);
+ const owner=await DB.get(OWNER_KEY),me=String(r.email).toLowerCase();
+ if(owner&&owner!==me){await wipeLocalData();await DB.set(OWNER_KEY,me);location.reload();return;}
+ await DB.set(OWNER_KEY,me);
  syncState={pushed:{},lastPulledAt:0,syncing:false};
  teamsLoaded=false;
  syncNow().then(()=>{if(view==='settings')render();});
 }
 /* Render's free plan sleeps the server after ~15 idle minutes and the first request then waits ~30–60s for it
    to boot — pinging health as soon as the login form shows starts that boot while the user is still typing */
-let authBusy=null,authEmail='',serverWoken=false;
+let authBusy=null,authEmail='',authName='',authMode='login',serverWoken=false;
+const PENDING_NAME_KEY='dpPendingName';
 function wakeSyncServer(){if(serverWoken)return;serverWoken=true;fetch(SYNC_API+'/api/health').catch(()=>{serverWoken=false;});}
+/* sign-in on a just-woken free-tier server: while it boots, Render answers 502/503/504 or drops the
+   connection, so those are retried for up to ~90s; each try is capped so a hung request can't freeze the form */
+async function authFetch(path,body){
+ const until=Date.now()+90000;let wait=2000,tries=0;
+ for(;;){
+   const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),45000);
+   try{tries++;return await apiFetch(path,{method:'POST',body:JSON.stringify(body),signal:ctl.signal});}
+   catch(e){e.retried=tries>1;if(![0,502,503,504].includes(e.status)||Date.now()+wait>until)throw e;}
+   finally{clearTimeout(timer);}
+   const n=document.getElementById('acc-note');if(n)n.textContent='The sync server is waking up — still trying, please keep this open…';
+   await new Promise(r=>setTimeout(r,wait));wait=Math.min(wait*1.5,8000);
+ }
+}
+/* which account the data on this device belongs to — deliberately not a 'dp:' key, so it is never synced */
+const OWNER_KEY='dpOwner';
+const DEVICE_KEYS=['dp:minimizeToTray'];
+async function wipeLocalData(){
+ clearTimeout(saveTimer);clearTimeout(syncDebounce);
+ const keys=await DB.list('dp:');
+ for(const k of keys)if(k!==ACCOUNT_KEY&&!DEVICE_KEYS.includes(k))await DB.delete(k);
+}
+/* everything is uploaded first, then this device's copy is erased so the next person to use the app
+   (or log in) sees none of it; it comes back from the server on the next login */
 async function doLogout(){
- account=null;await DB.delete(ACCOUNT_KEY);
+ clearTimeout(saveTimer);await DB.set(dayKey(dayStr),day);await DB.set(PREF,pref);
+ while(syncState.syncing)await new Promise(r=>setTimeout(r,200));
+ if(!await syncNow()){
+   if(!account){render();throw new Error('Your session expired. Log in again to save your latest changes, then log out.');}
+   throw new Error("Couldn't upload your latest changes, so you're still logged in and nothing was removed. Check your connection and try again.");
+ }
+ account=null;await DB.delete(ACCOUNT_KEY);await DB.delete(OWNER_KEY);
  syncState={pushed:{},lastPulledAt:0,syncing:false};
  myTeams=[];teamStateCache={};teamsLoaded=false;
+ await wipeLocalData();
+ location.reload();
 }
 
 /* ============ Team collaboration (server-backed, separate from the private per-account sync above) ============
@@ -900,8 +939,8 @@ async function syncRound(pullOnly){
  return touchedCurrent;
 }
 async function syncNow(){
- if(!syncEnabled()||syncState.syncing)return;
- syncState.syncing=true;
+ if(!syncEnabled()||syncState.syncing)return false;
+ syncState.syncing=true;let ok=false;
  try{
    // always pull and merge remote changes BEFORE computing what to push. A day's data is synced
    // as one whole blob per key, and fields like screenMin auto-update on their own — so if we
@@ -911,11 +950,13 @@ async function syncNow(){
    let touchedCurrent=await syncRound(true);
    touchedCurrent=await syncRound(false)||touchedCurrent;
    if(touchedCurrent&&typeof render==='function')render();
+   ok=true;
  }catch(e){
    if(e.status===401){account=null;await DB.delete(ACCOUNT_KEY);toast('Sync session expired — please log in again.');}
    console.error('sync failed',e);
  }
  syncState.syncing=false;
+ return ok;
 }
 setInterval(()=>{if(syncEnabled())syncNow();},120000);
 
@@ -967,6 +1008,7 @@ function freeSlots(acts){
 }
 
 /* ============ Stats ============ */
+function displayName(){return (String(pref&&pref.name||'').trim()||'User').split(/\s+/)[0];}
 function dayStats(d,ds){
  ds=ds||dayStr;
  const acts=d.activities||[];const total=acts.length||1;
@@ -1005,10 +1047,10 @@ async function loadDay(ds){
 function render(){
  if(!day)day={planned:false,activities:generateActivities(dayStr||todayStr()),priorities:[],focusMin:0,screenMin:0,review:null};
  const h=new Date().getHours(),g=h<12?'Good morning':h<17?'Good afternoon':'Good evening';
- document.getElementById('greeting').textContent={planner:'🗓️ Planner',analytics:'📊 Analytics',calendar:'📅 Calendar',notes:'📝 Notes',settings:'⚙️ Settings'}[view]||(g+', '+(pref.name||'there').split(' ')[0]+'! 👋');
+ document.getElementById('greeting').textContent={planner:'🗓️ Planner',analytics:'📊 Analytics',calendar:'📅 Calendar',notes:'📝 Notes',settings:'⚙️ Settings'}[view]||(g+', '+displayName()+'! 👋');
  document.getElementById('dateLabel').textContent=dateLabel(dayStr);
  document.body.classList.toggle('own-head',['today','habits','goals','work'].includes(view));
- const who=(pref.name||(account&&account.email?account.email.split('@')[0]:'')||'You').split(' ')[0];
+ const who=displayName();
  document.getElementById('avatarInit').textContent=who.charAt(0).toUpperCase();
  document.getElementById('avatarName').textContent=who;
  document.getElementById('bell').textContent=upcomingList(true).length||'';
@@ -1122,7 +1164,7 @@ async function viewToday(el){
  const yd=await DB.get(dayKey(addDays(dayStr,-1)));const ydScreen=yd&&yd.screenMin||0;
  el.innerHTML='';
  const h=new Date().getHours(),g=h<12?'Good morning':h<17?'Good afternoon':'Good evening';
- const who=(pref.name||'there').split(' ')[0];
+ const who=displayName();
  const dt=new Date(dayStr+'T00:00');
  const quote=HERO_QUOTES[(dt.getDate()+dt.getMonth())%HERO_QUOTES.length];
  const habits=pref.habits||[];const hDone=habits.filter(x=>x.history&&x.history[dayStr]===true).length;
@@ -2724,7 +2766,7 @@ function teamsModal(){
 function projectModal(pid){
  const p=pid?pref.workProjects.find(x=>x.id===pid):{name:'',color:ACT_COLORS[3],icon:'work'};
  openModal(pid?'Edit project':'New project',`
-  <div class="field"><label>Project name</label><input id="wp-name" value="${esc(p.name)}" placeholder="e.g. SROS Project"></div>
+  <div class="field"><label>Project name</label><input id="wp-name" value="${esc(p.name)}" placeholder="e.g. Website Redesign"></div>
   <div class="field"><label>Icon</label>${iconPicker(p.icon)}</div>
   <div class="field"><label>Colour</label><div class="chips">${ACT_COLORS.map(c=>`<button type="button" class="cpick" data-c="${c}" style="width:30px;height:30px;border-radius:8px;background:${c};border:2px solid ${c===p.color?'var(--ink)':'transparent'}"></button>`).join('')}</div></div>
  `,`${pid?'<button class="danger-link" id="wp-del" style="margin-right:auto;background:none;border:none;color:var(--red);font-weight:700;cursor:pointer;font-family:inherit">Delete</button>':''}<button class="btn" data-close>Cancel</button><button class="btn primary" id="wp-save">Save</button>`);
@@ -2773,7 +2815,7 @@ function taskModal(tid){
  const projOpts=`<option value="">— none —</option>`+(pref.workProjects||[]).map(p=>`<option value="${p.id}" ${base.projectId===p.id?'selected':''}>${esc(p.name)}</option>`).join('');
  const teamOpts=myTeams.map(tm=>`<option value="${tm.id}">${esc(tm.name)}</option>`).join('');
  const body=`
-  <div class="field"><label>Task name</label><input id="wt-title" value="${esc(base.title)}" placeholder="e.g. Prepare SROS Presentation"></div>
+  <div class="field"><label>Task name</label><input id="wt-title" value="${esc(base.title)}" placeholder="e.g. Prepare client presentation"></div>
   <div class="field"><label>Description</label><textarea id="wt-desc" placeholder="Optional details...">${esc(base.description||'')}</textarea></div>
   <div class="row2">
    <div class="field"><label>Project</label><select id="wt-proj">${projOpts}</select></div>
@@ -3079,34 +3121,10 @@ function editSharedRecurringModal(teamId,rtId){
  };
 }
 
-function defaultWorkSeed(){
- const sros={id:id(),name:'SROS Project',color:'#8b5cf6',icon:'work'};
- const compliance={id:id(),name:'Compliance',color:'#14b8a6',icon:'goal'};
- const client={id:id(),name:'Client Project',color:'#3b82f6',icon:'work'};
- const learning={id:id(),name:'Learning',color:'#f59e0b',icon:'grad'};
- const projects=[sros,compliance,client,learning];
- const today=todayStr();
- // "Update Timesheet" is seeded as a personal recurring task — real shared/team tasks only
- // appear once the user creates or joins a team (server-backed, see teamsModal()).
- const rt={id:id(),title:'Update Timesheet',description:'',projectId:'',priority:'Medium',freq:'weekly',days:[5],dayOfMonth:1,time:'16:00',shared:false,assignees:[],createdAt:Date.now()};
- const recurring=[rt];
- // must land on the same date ensureRecurringOccurrences() itself would compute for this template,
- // otherwise the lazy-generation pass creates a second, unlinked occurrence for the "real" Friday
- const occDate=weekDates(today).find(ds=>dowOf(ds)===5)||today;
- const tasks=[
-  {id:id(),title:'Complete SROS Presentation',description:'',projectId:sros.id,dueDate:addDays(today,5),priority:'High',status:'In Progress',progress:60,schedule:[],comments:[],history:[{ts:Date.now(),text:'Task created'}],createdAt:Date.now()},
-  {id:id(),title:'TARA Review Document',description:'',projectId:compliance.id,dueDate:addDays(today,2),priority:'Medium',status:'In Progress',progress:40,schedule:[],comments:[],history:[{ts:Date.now(),text:'Task created'}],createdAt:Date.now()},
-  {id:id(),title:'Security Assessment Report',description:'',projectId:client.id,dueDate:addDays(today,7),priority:'High',status:'Not Started',progress:30,schedule:[],comments:[],history:[{ts:Date.now(),text:'Task created'}],createdAt:Date.now()},
-  {id:id(),title:'Read ISO 21434 Chapter 8',description:'',projectId:learning.id,dueDate:addDays(today,3),priority:'Low',status:'Not Started',progress:20,schedule:[],comments:[],history:[{ts:Date.now(),text:'Task created'}],createdAt:Date.now()},
-  {id:id(),title:'Update Timesheet',description:'',projectId:'',dueDate:occDate,priority:'Medium',status:'In Progress',progress:44,recurringId:rt.id,occurrenceDate:occDate,schedule:[],comments:[],history:[{ts:Date.now(),text:'Occurrence created'}],createdAt:Date.now()},
- ];
- return {projects,tasks,recurring};
-}
-
 /* ============ VIEW: Settings ============ */
 function viewSettings(el){
  el.innerHTML=`<div class="grid"><div class="col"><div class="card"><div class="card-head"><h3>Profile & focus</h3></div>
-   <div class="field"><label>Your name</label><input id="s-name" value="${esc(pref.name)}"></div>
+   <div class="field"><label>Your name</label><input id="s-name" value="${esc(pref.name)}" placeholder="User"></div>
    <div class="row2"><div class="field"><label>Focus session length (min)</label><input id="s-focus" inputmode="numeric" value="${pref.focusLen||60}"></div><div class="field"><label>Daily focus goal (h)</label><input id="s-fg" inputmode="numeric" value="${pref.focusGoalH||4}"></div></div>
    <button class="btn primary" id="s-save">Save</button></div>
   <div class="card"><div class="card-head"><h3>Sleep planner</h3></div>${sleepBox()}</div></div>
@@ -3125,18 +3143,17 @@ function viewSettings(el){
       <button class="btn" id="logoutBtn" style="color:var(--red)">Log out</button>
     </div>
   `:`
-    <p class="sub" style="margin-top:0">Log in to sync your plan across devices.</p>
+    <p class="sub" style="margin-top:0">${authMode==='signup'?'Create an account to sync your plan across devices.':'Log in to sync your plan across devices.'}</p>
+    ${authMode==='signup'?`<div class="field"><label>Your name</label><input id="acc-name" placeholder="How should DayPlan greet you?" value="${esc(authName)}" ${authBusy?'disabled':''}></div>`:''}
     <div class="field"><label>Email</label><input id="acc-email" type="email" placeholder="you@example.com" value="${esc(authEmail)}" ${authBusy?'disabled':''}></div>
     <div class="field"><label>Password</label><input id="acc-pass" type="password" placeholder="At least 8 characters" ${authBusy?'disabled':''}></div>
     <div id="acc-err" style="color:var(--red);font-size:12px;margin:-4px 0 8px;display:none"></div>
     <div id="acc-note" class="sub" style="margin:-4px 0 8px;display:${authBusy?'block':'none'}">${authBusy?'Connecting to the sync server… if it has been idle for a while, this can take up to a minute. Please wait.':''}</div>
-    <div style="display:flex;gap:8px">
-      <button class="btn primary" id="loginBtn" style="flex:1;justify-content:center" ${authBusy?'disabled':''}>${authBusy==='login'?'Logging in…':'Log in'}</button>
-      <button class="btn" id="signupBtn" style="flex:1;justify-content:center" ${authBusy?'disabled':''}>${authBusy==='signup'?'Creating account…':'Sign up'}</button>
-    </div>
+    <button class="btn primary full" id="authBtn" ${authBusy?'disabled':''}>${authMode==='signup'?(authBusy?'Creating account…':'Create account'):(authBusy?'Logging in…':'Log in')}</button>
+    <div class="sub" style="margin:10px 0 0;text-align:center">${authMode==='signup'?'Already have an account?':'New to DayPlan?'} <button class="view-all" id="authSwitch" style="color:var(--green-600)" ${authBusy?'disabled':''}>${authMode==='signup'?'Log in':'Create an account'}</button></div>
   `}</div>
  </div></div>`;
- const saveP=()=>{pref.name=el.querySelector('#s-name').value.trim()||'Friend';pref.focusLen=Math.round(num(el.querySelector('#s-focus').value))||60;pref.focusGoalH=Math.round(num(el.querySelector('#s-fg').value))||4;queueSave();render();toast('Saved');};
+ const saveP=()=>{pref.name=el.querySelector('#s-name').value.trim();pref.focusLen=Math.round(num(el.querySelector('#s-focus').value))||60;pref.focusGoalH=Math.round(num(el.querySelector('#s-fg').value))||4;queueSave();render();toast('Saved');};
  el.querySelector('#s-save').onclick=saveP;
  el.querySelector('#s-save2').onclick=()=>{pref.phoneTarget=Math.round(num(el.querySelector('#s-phone').value)*60)||120;queueSave();render();toast('Saved');};
  el.querySelector('#npSw').onclick=e=>{pref.noPhoneSleep=!pref.noPhoneSleep;e.target.classList.toggle('on',pref.noPhoneSleep);queueSave();};
@@ -3145,7 +3162,7 @@ function viewSettings(el){
  wireSleep(el);
  if(account){
    el.querySelector('#syncNowBtn').onclick=async()=>{toast('Syncing…');await syncNow();render();toast('Synced ✅');};
-   el.querySelector('#logoutBtn').onclick=async()=>{await doLogout();render();toast('Logged out');};
+   el.querySelector('#logoutBtn').onclick=async e=>{const b=e.currentTarget;b.disabled=true;b.textContent='Saving & logging out…';try{await doLogout();}catch(err){b.disabled=false;b.textContent='Log out';toast(err.message);}};
  }else{
    wakeSyncServer();
    // only one auth request at a time: a Log in fired while a slow Sign up is still in flight reaches the
@@ -3153,21 +3170,28 @@ function viewSettings(el){
    const runAuth=async(kind)=>{
      if(authBusy)return;
      const email=el.querySelector('#acc-email').value.trim(),pass=el.querySelector('#acc-pass').value;
-     if(!email||!pass){const e2=el.querySelector('#acc-err');e2.textContent='Enter your email and password.';e2.style.display='block';return;}
+     const nm=el.querySelector('#acc-name');if(nm)authName=nm.value.trim();
+     const bad=m=>{const e2=el.querySelector('#acc-err');e2.textContent=m;e2.style.display='block';};
+     if(kind==='signup'&&!authName)return bad('Enter your name.');
+     if(!email||!pass)return bad('Enter your email and password.');
+     if(kind==='signup'&&pass.length<8)return bad('Password must be at least 8 characters.');
+     // survives the reload that happens when a different account's data has to be cleared first
+     if(kind==='signup')await DB.set(PENDING_NAME_KEY,authName);
      authBusy=kind;authEmail=email;
      if(view==='settings')render();
      let err=null;
      try{await (kind==='signup'?doRegister:doLogin)(email,pass);}catch(e){err=e;}
      authBusy=null;
      if(view==='settings')render();
-     if(!err){authEmail='';toast(kind==='signup'?'Account created — syncing in the background':'Logged in — syncing in the background');return;}
+     if(!err){if(kind==='signup'){pref.name=authName;await DB.delete(PENDING_NAME_KEY);queueSave();}authEmail='';authName='';authMode='login';render();toast(kind==='signup'?'Welcome, '+displayName()+'! Account created':'Logged in — syncing in the background');return;}
+     if(kind==='signup')await DB.delete(PENDING_NAME_KEY);
      const msg=err.status===409?'An account with that email already exists — use Log in instead.':err.status===429?'Too many attempts — wait a few minutes and try again.':err.message;
      const e2=document.getElementById('acc-err');
      if(e2){e2.textContent=msg;e2.style.display='block';}else toast(msg);
    };
-   el.querySelector('#loginBtn').onclick=()=>runAuth('login');
-   el.querySelector('#signupBtn').onclick=()=>runAuth('signup');
-   el.querySelector('#acc-pass').onkeydown=e=>{if(e.key==='Enter')runAuth('login');};
+   el.querySelector('#authBtn').onclick=()=>runAuth(authMode);
+   el.querySelector('#authSwitch').onclick=()=>{const nm=el.querySelector('#acc-name');if(nm)authName=nm.value;authEmail=el.querySelector('#acc-email').value;authMode=authMode==='signup'?'login':'signup';render();};
+   el.querySelector('#acc-pass').onkeydown=e=>{if(e.key==='Enter')runAuth(authMode);};
  }
 }
 function wireSleep(el){const sv=el.querySelector('#saveSleep');if(sv)sv.onclick=()=>{pref.wakeTime=el.querySelector('#wakeT').value||'07:00';pref.sleepHours=num(el.querySelector('#sleepH').value)||8;queueSave();render();toast('Sleep plan saved');};}
@@ -3320,20 +3344,15 @@ window.addEventListener('resize',()=>positionNowMarker());
 function defaultTemplates(){
  const T=(title,icon,color,start,end,recur,days)=>({id:id(),title,icon,color,start,end,recur,days:days||[],goalId:null});
  return [
-  T('Wake Up & Freshen Up','sun','#f59e0b','07:00','07:30','daily'),
-  T('Exercise / Workout','run','#22c55e','07:30','08:30','daily'),
-  T('Book Reading','book','#3b82f6','08:30','09:30','daily'),
-  T('Goal Setting & Learning','goal','#8b5cf6','09:30','10:30','daily'),
-  T('Work (Deep Work)','work','#f97316','10:30','16:00','weekday'),
-  T('Break / Rest','coffee','#14b8a6','16:00','17:00','daily'),
-  T('Personal Time / Refresh','smile','#f59e0b','17:00','18:00','daily'),
-  T('Class / Study','grad','#6366f1','18:00','19:00','daily'),
-  T('Walking','walk','#22c55e','19:00','20:00','daily'),
-  T('Family / Calls','phone','#3b82f6','20:00','21:00','daily'),
-  T('English Class','en','#ec4899','20:00','21:30','weekly',[2]),
-  T('English Class (Daily)','en','#ec4899','21:00','21:30','daily'),
-  T('English Learning (Videos)','play','#ef4444','21:30','22:30','daily'),
-  T('Wind Down & Prepare for Sleep','moon','#8b5cf6','22:30','23:00','daily'),
+  T('Wake Up & Morning Routine','sun','#f59e0b','07:00','07:30','daily'),
+  T('Exercise','run','#ec4899','07:30','08:15','daily'),
+  T('Breakfast','coffee','#14b8a6','08:15','08:45','daily'),
+  T('Deep Work','work','#f97316','09:00','12:30','weekday'),
+  T('Lunch Break','coffee','#14b8a6','12:30','13:30','daily'),
+  T('Focused Work','work','#f97316','13:30','17:00','weekday'),
+  T('Personal Time','smile','#3b82f6','18:00','19:00','daily'),
+  T('Reading','book','#6366f1','21:00','21:30','daily'),
+  T('Wind Down','moon','#8b5cf6','22:30','23:00','daily'),
   T('Sleep','bed','#6366f1','23:00','07:00','daily'),
  ];
 }
@@ -3356,8 +3375,7 @@ async function init(){
        {id:id(),name:'No Phone before Sleep',icon:'moon',history:{}},
        {id:id(),name:'Drink 2L Water',icon:'water',history:{}},
      ]};
-   const workSeed=defaultWorkSeed();
-   pref.workProjects=workSeed.projects;pref.workTasks=workSeed.tasks;pref.recurringTasks=workSeed.recurring;
+   pref.workProjects=[];pref.workTasks=[];pref.recurringTasks=[];
    // real first day — nothing pre-filled or auto-completed; every activity starts pending until the user acts on it
    const today=todayStr();
    dayStr=today;
@@ -3371,7 +3389,11 @@ async function init(){
  }
  applyDark();
  setView('today');
+ const pendingName=await DB.get(PENDING_NAME_KEY);
+ if(pendingName){if(!pref.name){pref.name=pendingName;queueSave();render();}await DB.delete(PENDING_NAME_KEY);}
+ wakeSyncServer();
  account=await DB.get(ACCOUNT_KEY);
+ if(account&&account.email&&!await DB.get(OWNER_KEY))await DB.set(OWNER_KEY,String(account.email).toLowerCase());
  if(syncEnabled())syncNow();
 }
 init();
